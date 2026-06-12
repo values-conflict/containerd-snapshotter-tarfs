@@ -152,47 +152,6 @@ func labelBlob(t *testing.T, cs content.Store, d digest.Digest, labels map[strin
 	}
 }
 
-// TestFindCompressedBlob verifies that findCompressedBlob can locate a layer blob (here, plain uncompressed so diffID == blob digest) by walking the image manifest graph.
-func TestFindCompressedBlob(t *testing.T) {
-	cs := newTestStore(t)
-	ctx := context.Background()
-
-	// plain (uncompressed) layer: diffID == blob digest
-	layerData, diffID := makePlainLayer(t, []struct{ name, body string }{
-		{"etc/", ""},
-		{"etc/hostname", "testhost"},
-	})
-	compDigest := diffID // uncompressed: same digest
-	ingestBlob(t, cs, layerData, compDigest, ocispec.MediaTypeImageLayer)
-
-	// build minimal config
-	configJSON := []byte(`{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":["` + diffID.String() + `"]}}`)
-	configDigest := digest.Canonical.FromBytes(configJSON)
-	ingestBlob(t, cs, configJSON, configDigest, ocispec.MediaTypeImageConfig)
-
-	// build manifest that links config and layer
-	manifestJSON := []byte(`{"schemaVersion":2,"config":{"digest":"` + configDigest.String() +
-		`","size":` + strconv.Itoa(len(configJSON)) + `},"layers":[{"digest":"` +
-		compDigest.String() + `","size":` + strconv.Itoa(len(layerData)) + `}]}`)
-	manifestDigest := digest.Canonical.FromBytes(manifestJSON)
-	ingestBlob(t, cs, manifestJSON, manifestDigest, ocispec.MediaTypeImageManifest)
-
-	// add the gc.ref labels to the manifest (as containerd does during pull)
-	labelBlob(t, cs, manifestDigest, map[string]string{
-		"containerd.io/gc.ref.content.config": configDigest.String(),
-		"containerd.io/gc.ref.content.l.0":    compDigest.String(),
-	})
-
-	// test
-	found, err := findCompressedBlob(ctx, cs, diffID)
-	if err != nil {
-		t.Fatalf("findCompressedBlob: %v", err)
-	}
-	if found != compDigest {
-		t.Errorf("findCompressedBlob = %s, want %s", found, compDigest)
-	}
-}
-
 // TestOpenLayerByDiffID_plain verifies that opening an uncompressed layer blob via diffID produces a working fs.FS backed by tarfs (fast path: diffID == blob digest, no gsip needed).
 func TestOpenLayerByDiffID_plain(t *testing.T) {
 	cs := newTestStore(t)

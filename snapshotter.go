@@ -12,6 +12,7 @@ import (
 
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"io"
 	"runtime"
 
@@ -30,10 +31,6 @@ import (
 
 	"github.com/jonjohnsonjr/targz/gsip"
 	"github.com/jonjohnsonjr/targz/tarfs"
-)
-
-const (
-	labelDiffID = "containerd.io/snapshot/diff-id"
 )
 
 // Snapshotter implements snapshots.Snapshotter by serving OCI image layers directly from the containerd content store via FUSE, without extraction.
@@ -140,25 +137,22 @@ func (s *Snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 }
 
 func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
-	var diffID string
+	// resolve the blob digest before taking the write lock (content store I/O is fine here)
+	blobDigest := s.resolveBlob(ctx, name)
 
 	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		_, info, _, err := storage.GetInfo(ctx, key)
-		if err != nil {
-			return fmt.Errorf("getting active snapshot %q info: %w", key, err)
-		}
-		diffID = info.Labels[labelDiffID]
-
 		id, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, opts...)
 		if err != nil {
 			return fmt.Errorf("committing snapshot %q as %q: %w", key, name, err)
 		}
 
-		// write sidecar so we can map storage ID → diffID at mount time
-		if diffID != "" {
-			if err := s.writeDiffID(id, diffID); err != nil {
-				return fmt.Errorf("writing diffid sidecar for %q: %w", id, err)
+		// write sidecar so we can map storage ID → blob at mount time
+		if blobDigest != "" {
+			if err := s.writeBlob(id, blobDigest.String()); err != nil {
+				return fmt.Errorf("writing blob sidecar for %q: %w", id, err)
 			}
+		} else {
+			log.Printf("tarfs: Commit %q: no blob resolved, layer will not be mountable", name)
 		}
 
 		return nil
@@ -177,6 +171,133 @@ func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	}
 
 	return nil
+}
+
+// resolveBlob returns the compressed blob digest for the snapshot being committed.
+// containerd wraps committed snapshot names as "namespace/seq/chainID"; the last component
+// is the OCI chainID, which uniquely identifies the layer's position in its chain.
+//
+// Fast path: for uncompressed blobs (tests; layer 0 where chainID == diffID == blob digest)
+// the blob lives at the chainID address itself in the content store.
+//
+// Main path: walk image manifests.  Manifests are fetched before layer extraction begins in
+// all containerd versions and pull paths, so they are always present at Commit time.  For each
+// manifest the image config provides rootfs.diff_ids; recomputing the OCI chain formula
+// identifies which layer index matches our chainID, and the manifest's Layers[i].Digest is
+// the compressed blob we want to cache.  This works across all containerd versions without
+// depending on opts labels or the timing of containerd.io/uncompressed.
+func (s *Snapshotter) resolveBlob(ctx context.Context, name string) digest.Digest {
+	pctx := propagateNamespace(ctx)
+	// containerd wraps names as "namespace/seq/chainID"; the last component is the chainID
+	chainID := name[strings.LastIndex(name, "/")+1:]
+
+	// fast path: uncompressed blob lives at its own digest (layer 0: chainID == diffID)
+	if d, err := digest.Parse(chainID); err == nil {
+		if _, csErr := s.cs.Info(pctx, d); csErr == nil {
+			return d
+		}
+	}
+
+	return s.findBlobByChainID(pctx, chainID)
+}
+
+// findBlobByChainID walks image manifests in the content store to find the compressed blob
+// digest for the layer identified by chainID.  For each blob with a
+// containerd.io/gc.ref.content.config label (an image manifest), it reads the manifest JSON
+// to get the layer descriptors and the image config to get rootfs.diff_ids, then recomputes
+// the OCI chainID chain until it finds a match.
+func (s *Snapshotter) findBlobByChainID(ctx context.Context, chainID string) digest.Digest {
+	var result digest.Digest
+	if err := s.cs.Walk(ctx, func(info content.Info) error {
+		if info.Labels["containerd.io/gc.ref.content.config"] == "" {
+			return nil
+		}
+
+		manifestRA, err := s.cs.ReaderAt(ctx, ocispec.Descriptor{Digest: info.Digest})
+		if err != nil {
+			return nil
+		}
+		manifestData, err := io.ReadAll(io.NewSectionReader(manifestRA, 0, manifestRA.Size()))
+		manifestRA.Close()
+		if err != nil {
+			return nil
+		}
+		var manifest struct {
+			Config struct {
+				Digest digest.Digest `json:"digest"`
+			} `json:"config"`
+			Layers []struct {
+				Digest digest.Digest `json:"digest"`
+			} `json:"layers"`
+		}
+		if err := json.Unmarshal(manifestData, &manifest); err != nil {
+			return nil
+		}
+		if len(manifest.Layers) == 0 {
+			return nil
+		}
+
+		configRA, err := s.cs.ReaderAt(ctx, ocispec.Descriptor{Digest: manifest.Config.Digest})
+		if err != nil {
+			return nil
+		}
+		configData, err := io.ReadAll(io.NewSectionReader(configRA, 0, configRA.Size()))
+		configRA.Close()
+		if err != nil {
+			return nil
+		}
+		var config struct {
+			RootFS struct {
+				DiffIDs []digest.Digest `json:"diff_ids"`
+			} `json:"rootfs"`
+		}
+		if err := json.Unmarshal(configData, &config); err != nil {
+			return nil
+		}
+		if len(config.RootFS.DiffIDs) != len(manifest.Layers) {
+			return nil
+		}
+
+		var chain digest.Digest
+		for i, diffID := range config.RootFS.DiffIDs {
+			if i == 0 {
+				chain = diffID
+			} else {
+				chain = digest.Canonical.FromString(chain.String() + " " + diffID.String())
+			}
+			if chain.String() == chainID {
+				result = manifest.Layers[i].Digest
+				return nil
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("tarfs: findBlobByChainID: content store walk error: %v", err)
+	}
+	return result
+}
+
+// findBlobByDiffID returns the compressed blob digest for the given diffID.
+// For uncompressed blobs (e.g. in tests) the blob lives at the diffID address itself.
+// For compressed blobs the digest is found via the containerd.io/uncompressed label.
+func (s *Snapshotter) findBlobByDiffID(ctx context.Context, diffIDStr string) digest.Digest {
+	diffID, err := digest.Parse(diffIDStr)
+	if err != nil {
+		return ""
+	}
+	// fast path: uncompressed blob stored at its own digest
+	if _, err := s.cs.Info(ctx, diffID); err == nil {
+		return diffID
+	}
+	// compressed blob labeled with containerd.io/uncompressed=diffID
+	var result digest.Digest
+	_ = s.cs.Walk(ctx, func(info content.Info) error {
+		if info.Labels["containerd.io/uncompressed"] == diffIDStr {
+			result = info.Digest
+		}
+		return nil
+	})
+	return result
 }
 
 func (s *Snapshotter) Remove(ctx context.Context, key string) error {
@@ -201,7 +322,7 @@ func (s *Snapshotter) Remove(ctx context.Context, key string) error {
 	// clean up state directories
 	_ = os.RemoveAll(filepath.Join(s.root, "upper", id))
 	_ = os.RemoveAll(filepath.Join(s.root, "work", id))
-	_ = os.Remove(s.diffIDPath(id))
+	_ = os.Remove(s.blobPath(id))
 
 	return nil
 }
@@ -392,58 +513,43 @@ func (s *Snapshotter) mountsFor(snap storage.Snapshot, am *activeMount) []mount.
 // openLayerByID opens the layer blob for the committed snapshot with the given storage ID and returns it as an fs.FS.
 func (s *Snapshotter) openLayerByID(ctx context.Context, storageID string) (fs.FS, error) {
 	ctx = propagateNamespace(ctx)
-	diffIDStr, err := s.readDiffID(storageID)
+	blobDigestStr, err := s.readBlob(storageID)
 	if err != nil {
-		return nil, fmt.Errorf("reading diffid for storage id %q: %w", storageID, err)
+		return nil, fmt.Errorf("reading blob for storage id %q: %w", storageID, err)
 	}
-	if diffIDStr == "" {
-		return nil, fmt.Errorf("no diffid recorded for storage id %q: %w", storageID, errdefs.ErrNotFound)
+	if blobDigestStr == "" {
+		return nil, fmt.Errorf("no blob recorded for storage id %q: %w", storageID, errdefs.ErrNotFound)
 	}
-
-	diffID, err := digest.Parse(diffIDStr)
+	blobDigest, err := digest.Parse(blobDigestStr)
 	if err != nil {
-		return nil, fmt.Errorf("parsing diffid %q: %w", diffIDStr, err)
+		return nil, fmt.Errorf("parsing blob digest for storage id %q: %w", storageID, err)
 	}
-
-	return s.openLayerByDiffID(ctx, diffID)
+	return s.openBlobAsFS(ctx, blobDigest)
 }
 
-// openLayerByDiffID finds the layer blob in the content store for diffID and returns it as an fs.FS backed by tarfs (with gsip for gzip blobs).
+// openLayerByDiffID finds the blob in the content store for diffID and returns it as an fs.FS.
+// Used directly by tests.
 func (s *Snapshotter) openLayerByDiffID(ctx context.Context, diffID digest.Digest) (fs.FS, error) {
-	// fast path 1: uncompressed layer stored at its own digest
-	ra, size, err := s.openBlob(ctx, ocispec.Descriptor{Digest: diffID})
+	blobDigest := s.findBlobByDiffID(ctx, diffID.String())
+	if blobDigest == "" {
+		return nil, fmt.Errorf("no content blob found for diffID %s: %w", diffID, errdefs.ErrNotFound)
+	}
+	return s.openBlobAsFS(ctx, blobDigest)
+}
+
+// openBlobAsFS opens the blob at blobDigest from the content store and returns it as an fs.FS
+// backed by tarfs.  Gzip-compressed blobs are handled transparently.
+func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest) (fs.FS, error) {
+	ra, size, err := s.openBlob(ctx, ocispec.Descriptor{Digest: blobDigest})
 	if err != nil {
-		// fast path 2: compressed blob already labeled with containerd.io/uncompressed
-		var compDigest digest.Digest
-		_ = s.cs.Walk(ctx, func(info content.Info) error {
-			if info.Labels["containerd.io/uncompressed"] == diffID.String() {
-				compDigest = info.Digest
-			}
-			return nil
-		})
-
-		if compDigest == "" {
-			// slow path: resolve via image manifest
-			var resolveErr error
-			compDigest, resolveErr = findCompressedBlob(ctx, s.cs, diffID)
-			if resolveErr != nil {
-				return nil, fmt.Errorf("no content blob found for diffID %s: %w", diffID, errdefs.ErrNotFound)
-			}
-			// label it so future calls use the fast path
-			labelLayerBlob(ctx, s.cs, compDigest, diffID)
-		}
-
-		ra, size, err = s.openBlob(ctx, ocispec.Descriptor{Digest: compDigest})
-		if err != nil {
-			return nil, fmt.Errorf("opening blob %s: %w", compDigest, err)
-		}
+		return nil, fmt.Errorf("opening blob %s: %w", blobDigest, err)
 	}
 
 	// detect gzip by magic bytes
 	header := make([]byte, 2)
 	if _, err := ra.ReadAt(header, 0); err != nil {
 		ra.Close()
-		return nil, fmt.Errorf("reading blob header for %s: %w", diffID, err)
+		return nil, fmt.Errorf("reading blob header for %s: %w", blobDigest, err)
 	}
 
 	var tarRA interface {
@@ -463,12 +569,12 @@ func (s *Snapshotter) openLayerByDiffID(ctx context.Context, diffID digest.Diges
 			r, gzErr := gzip.NewReader(io.NewSectionReader(ra, 0, size))
 			if gzErr != nil {
 				ra.Close()
-				return nil, fmt.Errorf("creating gzip reader for %s: %w", diffID, gzErr)
+				return nil, fmt.Errorf("creating gzip reader for %s: %w", blobDigest, gzErr)
 			}
 			var buf bytes.Buffer
 			if _, gzErr = io.Copy(&buf, r); gzErr != nil {
 				ra.Close()
-				return nil, fmt.Errorf("decompressing blob for %s: %w", diffID, gzErr)
+				return nil, fmt.Errorf("decompressing blob for %s: %w", blobDigest, gzErr)
 			}
 			r.Close()
 			data := buf.Bytes()
@@ -478,7 +584,7 @@ func (s *Snapshotter) openLayerByDiffID(ctx context.Context, diffID digest.Diges
 			zr, gsipErr := gsip.NewReader(ra, size)
 			if gsipErr != nil {
 				ra.Close()
-				return nil, fmt.Errorf("creating gsip reader for %s: %w", diffID, gsipErr)
+				return nil, fmt.Errorf("creating gsip reader for %s: %w", blobDigest, gsipErr)
 			}
 			tarRA = zr
 			tarSize = 1<<63 - 1 // uncompressed size unknown
@@ -492,7 +598,7 @@ func (s *Snapshotter) openLayerByDiffID(ctx context.Context, diffID digest.Diges
 	fsys, err := tarfs.New(tarRA, tarSize)
 	if err != nil {
 		ra.Close()
-		return nil, fmt.Errorf("building tarfs for %s: %w", diffID, err)
+		return nil, fmt.Errorf("building tarfs for %s: %w", blobDigest, err)
 	}
 
 	return fsys, nil
@@ -507,14 +613,14 @@ func (s *Snapshotter) openBlob(ctx context.Context, desc ocispec.Descriptor) (co
 	return ra, ra.Size(), nil
 }
 
-// writeDiffID records diffID for storageID in a sidecar file.
-func (s *Snapshotter) writeDiffID(storageID, diffID string) error {
-	return os.WriteFile(s.diffIDPath(storageID), []byte(diffID), 0o600)
+// writeBlob records the compressed blob digest for storageID in a sidecar file.
+func (s *Snapshotter) writeBlob(storageID, blobDigest string) error {
+	return os.WriteFile(s.blobPath(storageID), []byte(blobDigest), 0o600)
 }
 
-// readDiffID reads the diffID sidecar for storageID.  Returns "" when no sidecar exists (eg for snapshots created without a content blob, or for empty base layers).
-func (s *Snapshotter) readDiffID(storageID string) (string, error) {
-	data, err := os.ReadFile(s.diffIDPath(storageID))
+// readBlob reads the blob digest sidecar for storageID.  Returns "" when no sidecar exists.
+func (s *Snapshotter) readBlob(storageID string) (string, error) {
+	data, err := os.ReadFile(s.blobPath(storageID))
 	if os.IsNotExist(err) {
 		return "", nil
 	}
@@ -524,8 +630,8 @@ func (s *Snapshotter) readDiffID(storageID string) (string, error) {
 	return string(data), nil
 }
 
-func (s *Snapshotter) diffIDPath(storageID string) string {
-	return filepath.Join(s.root, "meta", storageID+".diffid")
+func (s *Snapshotter) blobPath(storageID string) string {
+	return filepath.Join(s.root, "meta", storageID+".blob")
 }
 
 // propagateNamespace extracts the containerd namespace from an incoming gRPC context and re-stamps it as an outgoing gRPC header so that downstream calls to the content-store proxy include the namespace correctly.

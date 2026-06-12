@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: 'bash -Eeuo pipefail -x {0}'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  lint:
+    # TODO: add a Go version matrix (at minimum: stable + oldstable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+      - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+        with:
+          go-version: stable
+
+      - run: gofmt -s -w .
+      - run: go mod tidy
+      - run: go generate ./...
+      # make sure fmt, tidy, and generate didn't leave any uncommitted changes behind
+      - run: git diff --exit-code
+
+      - run: go vet ./...
+
+      - name: go-licenses check
+        run: go run github.com/google/go-licenses@v1.6.0 check ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+
+  test:
+    # TODO: add a Go version matrix (at minimum: stable + oldstable)
+    # TODO: add a containerd version matrix (target: v1.7.x through v2.x, covering the full proxy snapshotter protocol range)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+      - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+        with:
+          go-version: stable
+
+      - run: sudo apt-get install --no-install-recommends fuse3
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      - run: go build -o containerd-snapshotter-tarfs .
+
+      - name: start snapshotter
+        run: |
+          sudo mkdir --parents /run/containerd-snapshotter-tarfs
+          sudo "$PWD/containerd-snapshotter-tarfs" > /tmp/snapshotter.log 2>&1 &
+          for i in $(seq 30); do
+            if [ -S /run/containerd-snapshotter-tarfs/snapshotter.sock ]; then
+              break
+            fi
+            sleep 1
+            [ "$i" -lt 30 ] || { echo >&2 'error: timed out waiting for snapshotter'; exit 1; }
+          done
+
+      - name: containerd config
+        run: |
+          dpkgArch="$(dpkg --print-architecture)"
+          case "$dpkgArch" in
+            amd64) platform='linux/amd64' ;;
+            arm64) platform='linux/arm64' ;;
+            *) echo >&2 "error: unsupported architecture '$dpkgArch'"; exit 1 ;;
+          esac
+          sudo containerd config default | sudo tee /etc/containerd/config.toml
+          sudo mkdir --parents /etc/containerd/conf.d
+          sudo tee /etc/containerd/conf.d/tarfs.toml <<-EOF
+          [proxy_plugins.tarfs]
+            type = "snapshot"
+            address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+          [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+            snapshotter = "tarfs"
+            platform = "$platform"
+          EOF
+          sudo systemctl restart containerd
+          for i in $(seq 30); do
+            if sudo ctr version >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+            [ "$i" -lt 30 ] || { echo >&2 'error: timed out waiting for containerd'; exit 1; }
+          done
+
+      - run: sudo ctr images pull --snapshotter tarfs docker.io/tianon/true:oci
+      - name: mount tianon/true:oci
+        run: |
+          sudo mkdir --parents /mnt/true
+          sudo ctr images mount --snapshotter tarfs docker.io/tianon/true:oci /mnt/true
+          test -f /mnt/true/true
+          /mnt/true/true
+          sudo ctr images unmount /mnt/true
+
+      - run: sudo ctr images pull --snapshotter tarfs docker.io/library/bash:latest
+      - name: mount bash:latest
+        run: |
+          trap 'echo "=== snapshotter log ===" && sudo cat /tmp/snapshotter.log' EXIT
+          sudo mkdir --parents /mnt/bash
+          sudo ctr images mount --snapshotter tarfs docker.io/library/bash:latest /mnt/bash
+          test -f /mnt/bash/usr/local/bin/bash
+          sudo ctr images unmount /mnt/bash
+
+      - name: badtars
+        run: |
+          for tag in \
+            badtars-duplicate-members \
+            badtars-empty-filename \
+            badtars-html \
+            badtars-invalid-utf8 \
+            badtars-invalid-whiteout \
+            badtars-missing-contents \
+            badtars-newline \
+            badtars-overlong-utf8 \
+          ; do
+            sudo ctr images pull --snapshotter tarfs "docker.io/tianon/test:$tag" || continue
+            sudo mkdir --parents "/mnt/$tag"
+            sudo ctr images mount --snapshotter tarfs "docker.io/tianon/test:$tag" "/mnt/$tag" || continue
+            sudo ctr images unmount "/mnt/$tag" || :
+          done
+
+      - name: sanity check after badtars
+        run: |
+          sudo mkdir --parents /mnt/true-final
+          sudo ctr images mount --snapshotter tarfs docker.io/tianon/true:oci /mnt/true-final
+          test -f /mnt/true-final/true
+          /mnt/true-final/true
+          sudo ctr images unmount /mnt/true-final

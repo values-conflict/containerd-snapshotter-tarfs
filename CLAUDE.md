@@ -2,6 +2,10 @@
 
 A FUSE-based snapshotter for containerd that mounts container image layers directly from the content store as live tar filesystems -- no extraction step, no duplicate disk usage.
 
+## Style
+
+This is a Tianon-maintained repository -- [tianonfmt style guides](https://github.com/values-conflict/tianonfmt/tree/cc3b1f1b172d6e35c773a19ab8b12733105730a8/docs) apply as authoritative for all file types.  Prose mode is **Cute/Lenient** (not Strict): the curated set of Unicode characters documented in [prose.md](https://github.com/values-conflict/tianonfmt/blob/cc3b1f1b172d6e35c773a19ab8b12733105730a8/docs/prose.md) is acceptable to leave in place.
+
 ## Why?
 
 The standard containerd snapshotters (overlay, native) extract each layer's tar into a separate directory tree.  For large images or read-heavy workloads this wastes both disk space and startup time.  The goal here is to skip extraction entirely and serve the filesystem directly from the compressed blobs already sitting in the content store.

@@ -17,6 +17,7 @@ The standard containerd snapshotters (overlay, native) extract each layer's tar 
 - Implement the whiteout semantics (`.wh.<name>` and `.wh..wh..opq`) required by the OCI layer spec so upper layers correctly shadow lower ones
 - Register as a proxy snapshotter so containerd can delegate to it over a Unix socket
 - Keep the implementation self-contained: one binary, one Unix socket, no kernel modules
+- Support containerd proxy snapshotter clients from v1.7.x through current (v2.x) — the gRPC proxy protocol is stable across versions
 
 ## Architecture
 

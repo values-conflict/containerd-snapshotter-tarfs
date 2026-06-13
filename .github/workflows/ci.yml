@@ -44,8 +44,16 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 
   test:
-    # TODO: add a containerd version matrix (target: v1.7.x through v2.x, covering the full proxy snapshotter protocol range)
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        containerd:
+          - 1.7.32
+          - 2.0.9
+          - 2.1.8
+          - 2.2.4
+          - 2.3.1
+      fail-fast: false
     steps:
       - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
       - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
@@ -53,6 +61,47 @@ jobs:
           go-version-file: go.mod
 
       - run: sudo apt-get install --no-install-recommends fuse3
+
+      - name: download containerd ${{ matrix.containerd }}
+        env:
+          CONTAINERD_VERSION: ${{ matrix.containerd }}
+        run: |
+          dpkgArch="$(dpkg --print-architecture)"
+          case "$dpkgArch" in
+            amd64) arch='amd64' ;;
+            arm64) arch='arm64' ;;
+            *) echo >&2 "error: unsupported architecture '$dpkgArch'"; exit 1 ;;
+          esac
+          tarball="containerd-${CONTAINERD_VERSION}-linux-${arch}.tar.gz"
+          url="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/${tarball}"
+          cd /tmp
+          curl -fsSL "$url" -o "$tarball"
+          case "${CONTAINERD_VERSION}-${arch}" in
+            1.7.32-amd64) sha256='4db81bc7c67ec5e5e38ec43f287e1eab6962035cd1f4a904694700ca40698b03' ;;
+            1.7.32-arm64) sha256='631e7079dba58806e5a03158773030e4ac63c69343afe02e5419fb848485569c' ;;
+            2.0.9-amd64)  sha256='3d2dc5e1f47888b4f8fa30fabf7f1b8ea20e1572c85e20557a3bb8bab81a54a3' ;;
+            2.0.9-arm64)  sha256='fa582638e396f6182348142d642ce65d2efd68f01751d16310446fc8f15fddb2' ;;
+            2.1.8-amd64)  sha256='ad2ed5bca4839109ec271e3ee0285abf36bec450956c5d59a31f1a980e8d71a9' ;;
+            2.1.8-arm64)  sha256='c7c3d64fafbaccb4fb0143c82402db7d6c781e776d818a60fa0df94807814149' ;;
+            2.2.4-amd64)  sha256='62e77f6294e432dca5b56ad7e7d6085b5bbb526ebba0a51d832714f9b04cfdfd' ;;
+            2.2.4-arm64)  sha256='d0897c8e27c96a7b7d4c73e9b278ea9f559dda619d497d88b323a528bd1412c3' ;;
+            2.3.1-amd64)  sha256='628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054' ;;
+            2.3.1-arm64)  sha256='46a83603a850f3916ca7c942310daaf82ed17773a85b1d431e92d4a541e46d0d' ;;
+            *) echo >&2 "error: no checksum for containerd ${CONTAINERD_VERSION} ${arch}"; exit 1 ;;
+          esac
+          sha256sum --check --strict <<<"${sha256}  ${tarball}"
+          sudo tar --extract --file "$tarball" --directory /usr/local/bin/ --strip-components=1
+          [ "$(command -v containerd)" = '/usr/local/bin/containerd' ]
+          [ "$(command -v ctr)" = '/usr/local/bin/ctr' ]
+          sudo mkdir --parents /etc/systemd/system/containerd.service.d
+          sudo tee /etc/systemd/system/containerd.service.d/execstart.conf << 'EOF'
+          [Service]
+          ExecStart=
+          ExecStart=/usr/local/bin/containerd
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemctl restart containerd
+          sudo ctr version
 
       - name: go test
         run: go test -race -count=1 ./...
@@ -79,7 +128,10 @@ jobs:
             arm64) platform='linux/arm64' ;;
             *) echo >&2 "error: unsupported architecture '$dpkgArch'"; exit 1 ;;
           esac
-          sudo containerd config default | sudo tee /etc/containerd/config.toml
+          {
+            printf '%s\n' 'imports = ["/etc/containerd/conf.d/*.toml"]'
+            containerd config default | grep --invert-match '^imports'
+          } | sudo tee /etc/containerd/config.toml > /dev/null
           sudo mkdir --parents /etc/containerd/conf.d
           sudo tee /etc/containerd/conf.d/tarfs.toml <<-EOF
           [proxy_plugins.tarfs]

@@ -19,13 +19,12 @@ permissions:
 jobs:
 
   lint:
-    # TODO: add a Go version matrix (at minimum: stable + oldstable)
     runs-on: ubuntu-latest
     steps:
       - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
       - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - run: gofmt -s -w .
       - run: go mod tidy
@@ -45,14 +44,13 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 
   test:
-    # TODO: add a Go version matrix (at minimum: stable + oldstable)
     # TODO: add a containerd version matrix (target: v1.7.x through v2.x, covering the full proxy snapshotter protocol range)
     runs-on: ubuntu-latest
     steps:
       - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
       - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - run: sudo apt-get install --no-install-recommends fuse3
 

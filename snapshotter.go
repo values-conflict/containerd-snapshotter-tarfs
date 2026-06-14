@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"io"
-	"runtime"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -429,7 +431,14 @@ func (s *Snapshotter) buildMount(ctx context.Context, key string, snap storage.S
 			return nil, fmt.Errorf("creating mountpoint %q: %w", mountpoint, err)
 		}
 
+		// the tarfs content is immutable (fixed tar archive), so it is safe to
+		// cache FUSE dentries and attrs indefinitely -- the kernel default of 1s
+		// causes ESTALE when overlayfs tries to reconstruct expired dentries via
+		// d_real() without CAP_EXPORT_SUPPORT, breaking ctr run
+		forever := time.Duration(math.MaxInt64)
 		server, err := go2fuse.Mount(mountpoint, merged, &gofusefs.Options{
+			EntryTimeout: &forever,
+			AttrTimeout:  &forever,
 			MountOptions: fuse.MountOptions{
 				AllowOther: true,
 				FsName:     "tarfs",
@@ -540,7 +549,9 @@ func (s *Snapshotter) openLayerByDiffID(ctx context.Context, diffID digest.Diges
 // openBlobAsFS opens the blob at blobDigest from the content store and returns it as an fs.FS
 // backed by tarfs.  Gzip-compressed blobs are handled transparently.
 func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest) (fs.FS, error) {
-	ra, size, err := s.openBlob(ctx, ocispec.Descriptor{Digest: blobDigest})
+	// blob data is immutable (content-addressed); detach from the snapshot RPC context
+	// so the ReaderAt outlives it, while preserving gRPC metadata (namespace etc.)
+	ra, size, err := s.openBlob(context.WithoutCancel(ctx), ocispec.Descriptor{Digest: blobDigest})
 	if err != nil {
 		return nil, fmt.Errorf("opening blob %s: %w", blobDigest, err)
 	}
@@ -588,8 +599,6 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 			}
 			tarRA = zr
 			tarSize = 1<<63 - 1 // uncompressed size unknown
-			// give the checkpoint goroutine a moment to drain the channel
-			runtime.Gosched()
 		}
 	} else {
 		tarRA = ra
@@ -600,7 +609,12 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 		ra.Close()
 		return nil, fmt.Errorf("building tarfs for %s: %w", blobDigest, err)
 	}
-
+	// tarfs.New just completed the sequential scan, sending all checkpoint updates
+	// into the gsip drain goroutine's channel; yield so it can flush them into
+	// r.checkpoints before any FUSE read calls gsip.ReadAt
+	if _, ok := tarRA.(*gsip.Reader); ok {
+		runtime.Gosched()
+	}
 	return fsys, nil
 }
 

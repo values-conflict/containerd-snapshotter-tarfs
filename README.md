@@ -29,17 +29,16 @@ Flags:
 Add the following to your `config.toml` (typically `/etc/containerd/config.toml`):
 
 ```toml
-[proxy_plugins]
-  [proxy_plugins.tarfs]
-    type = "snapshot"
-    address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+[proxy_plugins.tarfs]
+  type = "snapshot"
+  address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
 
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   snapshotter = "tarfs"
-  differ = ""
+  platform = "linux"
 ```
 
-The `unpack_config` entry is required so that the transfer service sets `containerd.io/snapshot/diff-id` labels during image pulls -- without it, layer blobs can't be resolved back to their content store entries.
+The `unpack_config` entry is required so that the transfer service sets `containerd.io/snapshot/diff-id` labels during image pulls -- without it, layer blobs can't be resolved back to their content store entries.  The `platform` field cannot be omitted (an empty string fails to parse), but `"linux"` matches all Linux architectures since `check_platform_supported` defaults to `false`, which means only the OS is checked -- cross-architecture pulls (`--platform linux/arm64` on an amd64 host, etc.) work correctly.
 
 After updating the config, start `containerd-snapshotter-tarfs` before (or alongside) `containerd`, then pull and run images using `--snapshotter tarfs`:
 

@@ -122,25 +122,19 @@ jobs:
 
       - name: containerd config
         run: |
-          dpkgArch="$(dpkg --print-architecture)"
-          case "$dpkgArch" in
-            amd64) platform='linux/amd64' ;;
-            arm64) platform='linux/arm64' ;;
-            *) echo >&2 "error: unsupported architecture '$dpkgArch'"; exit 1 ;;
-          esac
           {
             printf '%s\n' 'imports = ["/etc/containerd/conf.d/*.toml"]'
             containerd config default | grep --invert-match '^imports'
           } | sudo tee /etc/containerd/config.toml > /dev/null
           sudo mkdir --parents /etc/containerd/conf.d
-          sudo tee /etc/containerd/conf.d/tarfs.toml <<-EOF
+          sudo tee /etc/containerd/conf.d/tarfs.toml << 'EOF'
           [proxy_plugins.tarfs]
             type = "snapshot"
             address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
 
           [[plugins."io.containerd.transfer.v1.local".unpack_config]]
             snapshotter = "tarfs"
-            platform = "$platform"
+            platform = "linux"
           EOF
           sudo systemctl restart containerd
           for i in $(seq 30); do

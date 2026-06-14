@@ -60,7 +60,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - run: sudo apt-get install --no-install-recommends fuse3
+      - run: sudo apt-get install --no-install-recommends fuse3 qemu-user-static
 
       - name: download containerd ${{ matrix.containerd }}
         env:
@@ -157,11 +157,23 @@ jobs:
       - run: sudo ctr images pull --snapshotter tarfs docker.io/library/bash:latest
       - name: mount bash:latest
         run: |
-          trap 'echo "=== snapshotter log ===" && sudo cat /tmp/snapshotter.log' EXIT
           sudo mkdir --parents /mnt/bash
           sudo ctr images mount --snapshotter tarfs docker.io/library/bash:latest /mnt/bash
           test -f /mnt/bash/usr/local/bin/bash
+          grep containerd-snapshotter-tarfs /proc/mounts
           sudo ctr images unmount /mnt/bash
+
+      - name: ctr run bash:latest (FUSE)
+        run: |
+          sudo ctr run --rm --snapshotter tarfs docker.io/library/bash:latest fuse-check \
+            grep containerd-snapshotter-tarfs /proc/mounts
+
+      - run: sudo ctr images pull --snapshotter tarfs --platform linux/arm64/v8 docker.io/library/bash:latest
+      - name: ctr run bash:latest linux/arm64/v8
+        run: |
+          output="$(sudo ctr run --rm --snapshotter tarfs --platform linux/arm64/v8 docker.io/library/bash:latest arm64-test apk --print-arch)"
+          echo "$output"
+          [ "$output" = 'aarch64' ]
 
       - name: badtars
         run: |
@@ -188,3 +200,7 @@ jobs:
           test -f /mnt/true-final/true
           /mnt/true-final/true
           sudo ctr images unmount /mnt/true-final
+
+      - name: snapshotter log
+        run: sudo cat /tmp/snapshotter.log
+        if: failure()

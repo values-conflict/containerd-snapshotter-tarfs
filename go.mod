@@ -37,3 +37,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260610212136-7ab31c22f7ad // indirect
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 )
+
+// https://github.com/cpuguy83/go2fuse/pull/2: "Set `Nlink` in `fillAttrFromFileInfo`"
+// https://github.com/cpuguy83/go2fuse/pull/3: "Implement `NodeReader` on `fileNode`"
+replace github.com/cpuguy83/go2fuse => github.com/tianon-sso/go2fuse v0.0.0-20260614052731-6a3eb2784728

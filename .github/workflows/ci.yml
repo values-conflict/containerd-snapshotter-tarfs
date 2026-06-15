@@ -91,17 +91,38 @@ jobs:
           esac
           sha256sum --check --strict <<<"${sha256}  ${tarball}"
           sudo tar --extract --file "$tarball" --directory /usr/local/bin/ --strip-components=1
+
           [ "$(command -v containerd)" = '/usr/local/bin/containerd' ]
           [ "$(command -v ctr)" = '/usr/local/bin/ctr' ]
+
           sudo mkdir --parents /etc/systemd/system/containerd.service.d
           sudo tee /etc/systemd/system/containerd.service.d/execstart.conf << 'EOF'
           [Service]
           ExecStart=
           ExecStart=/usr/local/bin/containerd
           EOF
+
+          {
+            printf '%s\n' 'imports = ["/etc/containerd/conf.d/*.toml"]'
+            containerd config default | grep --invert-match '^imports'
+          } | sudo tee /etc/containerd/config.toml > /dev/null
+          sudo mkdir --parents /etc/containerd/conf.d
+
+          trap "$(printf 'sudo systemctl status --lines=0 containerd || :; sudo journalctl -u containerd --since %q || :' "$(date '+%Y-%m-%d %H:%M:%S')")" ERR
           sudo systemctl daemon-reload
           sudo systemctl restart containerd
           sudo ctr version
+
+      - name: docker config
+        run: |
+          jq --null-input --tab '{
+            #"containerd": "/run/containerd/containerd.sock", # already configured via --containerd=/run/containerd/containerd.sock in docker.service -- generates "unable to configure the Docker daemon with file /etc/docker/daemon.json: the following directives are specified both as a flag and in the configuration file: containerd: (from flag: /run/containerd/containerd.sock, from file: /run/containerd/containerd.sock)" which is some classic Docker
+            "features": { "containerd-snapshotter": true },
+          }' | sudo tee /etc/docker/daemon.json
+
+          trap "$(printf 'sudo systemctl status --lines=0 docker || :; sudo journalctl -u docker --since %q || :' "$(date '+%Y-%m-%d %H:%M:%S')")" ERR
+          sudo systemctl restart docker
+          docker version
 
       - name: go test
         run: go test -race -count=1 ./...
@@ -124,11 +145,6 @@ jobs:
         env:
           CONTAINERD_VERSION: ${{ matrix.containerd }}
         run: |
-          {
-            printf '%s\n' 'imports = ["/etc/containerd/conf.d/*.toml"]'
-            containerd config default | grep --invert-match '^imports'
-          } | sudo tee /etc/containerd/config.toml > /dev/null
-          sudo mkdir --parents /etc/containerd/conf.d
           sudo tee /etc/containerd/conf.d/tarfs.toml << 'EOF'
           [proxy_plugins.tarfs]
             type = "snapshot"
@@ -155,14 +171,16 @@ jobs:
           EOF
               ;;
           esac
+
+          trap "$(printf 'sudo systemctl status --lines=0 containerd || :; sudo journalctl -u containerd --since %q || :' "$(date '+%Y-%m-%d %H:%M:%S')")" ERR
           sudo systemctl restart containerd
-          for i in $(seq 30); do
-            if sudo ctr version >/dev/null 2>&1; then
-              break
-            fi
-            sleep 1
-            [ "$i" -lt 30 ] || { echo >&2 'error: timed out waiting for containerd'; exit 1; }
-          done
+          sudo ctr version
+
+          jq --tab '."storage-driver" = "tarfs"' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          trap "$(printf 'sudo systemctl status --lines=0 docker || :; sudo journalctl -u docker --since %q || :' "$(date '+%Y-%m-%d %H:%M:%S')")" ERR
+          sudo systemctl restart docker
+          docker version
 
       - run: sudo ctr images pull --snapshotter tarfs docker.io/tianon/true:oci
       - name: mount tianon/true:oci
@@ -219,6 +237,16 @@ jobs:
           test -f /mnt/true-final/true
           /mnt/true-final/true
           sudo ctr images unmount /mnt/true-final
+
+      - run: docker pull docker.io/library/bash:latest
+
+      - name: docker run bash:latest (FUSE)
+        run: docker run --rm docker.io/library/bash:latest grep containerd-snapshotter-tarfs /proc/mounts
+
+      - name: docker run bash:latest linux/arm64/v8
+        run: |
+          output="$(docker run --rm --platform linux/arm64/v8 docker.io/library/bash:latest apk --print-arch)"
+          [ "$output" = 'aarch64' ]
 
       - name: snapshotter log
         run: sudo cat /tmp/snapshotter.log

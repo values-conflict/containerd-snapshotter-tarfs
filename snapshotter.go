@@ -527,6 +527,11 @@ func (s *Snapshotter) openLayerByID(ctx context.Context, storageID string) (fs.F
 		return nil, fmt.Errorf("reading blob for storage id %q: %w", storageID, err)
 	}
 	if blobDigestStr == "" {
+		// no blob (e.g. Docker's synthetic init layer written directly to the upper dir)
+		upperDir := filepath.Join(s.root, "upper", storageID)
+		if info, statErr := os.Stat(upperDir); statErr == nil && info.IsDir() {
+			return os.DirFS(upperDir), nil
+		}
 		return nil, fmt.Errorf("no blob recorded for storage id %q: %w", storageID, errdefs.ErrNotFound)
 	}
 	blobDigest, err := digest.Parse(blobDigestStr)

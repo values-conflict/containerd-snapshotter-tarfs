@@ -60,6 +60,33 @@ $ ctr images pull --snapshotter tarfs docker.io/library/hello-world:latest
 $ ctr images mount --snapshotter tarfs docker.io/library/hello-world:latest /mnt/hello-world
 ```
 
+## Configuring Docker
+
+Add to `/etc/docker/daemon.json`:
+
+```json
+{
+	"containerd": "/run/containerd/containerd.sock",
+	"features": {
+		"containerd-snapshotter": true
+	},
+	"storage-driver": "tarfs"
+}
+```
+
+- `"containerd"` -- points Docker at the same containerd instance where tarfs is registered; omit if Docker already connects to `/run/containerd/containerd.sock` via its service unit (specifying the same value in both places causes a startup error)
+- `"features": {"containerd-snapshotter": true}` -- enables the containerd image store; without it, `"storage-driver"` is treated as a graph driver name and fails
+- `"storage-driver": "tarfs"` -- selects tarfs as Docker's default snapshotter
+
+Restart Docker _after_ `containerd-snapshotter-tarfs` is running and containerd has tarfs in its proxy plugins.  Docker queries containerd for available snapshotters at startup -- if tarfs isn't registered yet, Docker won't find it.
+
+Once configured, `docker pull` and `docker run` use tarfs automatically (Docker doesn't expose a per-command `--snapshotter` flag):
+
+```console
+$ docker pull docker.io/library/bash:latest
+$ docker run --rm docker.io/library/bash:latest bash --version
+```
+
 ## Notes
 
 FUSE mounts require `CAP_SYS_ADMIN` (or a user namespace with `--map-root-user`).  In a dev environment without root, wrap all processes in a shared namespace:

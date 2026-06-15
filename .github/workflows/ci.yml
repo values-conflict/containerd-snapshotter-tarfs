@@ -121,6 +121,8 @@ jobs:
           done
 
       - name: containerd config
+        env:
+          CONTAINERD_VERSION: ${{ matrix.containerd }}
         run: |
           {
             printf '%s\n' 'imports = ["/etc/containerd/conf.d/*.toml"]'
@@ -136,6 +138,23 @@ jobs:
             snapshotter = "tarfs"
             platform = "linux"
           EOF
+          case "$CONTAINERD_VERSION" in
+            2.0.*)
+              # containerd v2.0.x predates check_platform_supported, breaking cross-arch pulls with a custom snapshotter unless we are more specific in the config
+              sudo head -3 /etc/containerd/conf.d/tarfs.toml | sudo tee /etc/containerd/conf.d/tarfs.toml.new
+              sudo mv /etc/containerd/conf.d/tarfs.toml.new /etc/containerd/conf.d/tarfs.toml
+              sudo tee /etc/containerd/conf.d/tarfs-c8d-2.0.toml <<'EOF'
+          [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+            snapshotter = "tarfs"
+            platform = "linux/amd64"
+
+          [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+            snapshotter = "tarfs"
+            platform = "linux/arm64"
+            differ = "walking"
+          EOF
+              ;;
+          esac
           sudo systemctl restart containerd
           for i in $(seq 30); do
             if sudo ctr version >/dev/null 2>&1; then

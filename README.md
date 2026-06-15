@@ -40,6 +40,19 @@ Add the following to your `config.toml` (typically `/etc/containerd/config.toml`
 
 The `unpack_config` entry is required so that the transfer service sets `containerd.io/snapshot/diff-id` labels during image pulls -- without it, layer blobs can't be resolved back to their content store entries.  The `platform` field cannot be omitted (an empty string fails to parse), but `"linux"` matches all Linux architectures since `check_platform_supported` defaults to `false`, which means only the OS is checked -- cross-architecture pulls (`--platform linux/arm64` on an amd64 host, etc.) work correctly.
 
+containerd v2.0.x predates `check_platform_supported`, so `platform = "linux"` only matches the host architecture there and cross-architecture pulls fail.  The workaround is to replace the single entry with one per architecture, using `differ = "walking"` on any entry whose platform does not match the host (since v2.0.x selects the differ by matching the configured platform against the host's registered differs, and specifying the differ by name bypasses that check):
+
+```toml
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  snapshotter = "tarfs"
+  platform = "linux/amd64"
+
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  snapshotter = "tarfs"
+  platform = "linux/arm64"
+  differ = "walking"
+```
+
 After updating the config, start `containerd-snapshotter-tarfs` before (or alongside) `containerd`, then pull and run images using `--snapshotter tarfs`:
 
 ```console

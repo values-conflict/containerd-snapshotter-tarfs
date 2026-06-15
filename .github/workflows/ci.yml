@@ -248,6 +248,29 @@ jobs:
           output="$(docker run --rm --platform linux/arm64/v8 docker.io/library/bash:latest apk --print-arch)"
           [ "$output" = 'aarch64' ]
 
+      - name: docker commit
+        run: |
+          docker run --name tarfs-commit-test bash:latest sh -c 'grep containerd-snapshotter-tarfs /proc/mounts > /tarfs.txt'
+          docker commit tarfs-commit-test tarfs-commit-image
+          docker rm tarfs-commit-test
+          docker run --rm tarfs-commit-image cat /tarfs.txt
+
+      - name: docker build (classic)
+        run: |
+          DOCKER_BUILDKIT=0 docker build --tag tarfs-classic-image - << 'EOF'
+          FROM bash:latest
+          RUN grep containerd-snapshotter-tarfs /proc/mounts > /tarfs.txt
+          EOF
+          docker run --rm tarfs-classic-image cat /tarfs.txt
+
+      - name: docker build (buildkit)
+        run: |
+          DOCKER_BUILDKIT=1 docker build --tag tarfs-buildkit-image - << 'EOF'
+          FROM bash:latest
+          RUN grep containerd-snapshotter-tarfs /proc/mounts > /tarfs.txt
+          EOF
+          docker run --rm tarfs-buildkit-image cat /tarfs.txt
+
       - name: snapshotter log
         run: sudo cat /tmp/snapshotter.log
         if: failure()

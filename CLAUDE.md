@@ -24,25 +24,24 @@ The standard containerd snapshotters (overlay, native) extract each layer's tar 
 **Package layout:** all Go source lives at the module root (`package main`), giving us a single binary.
 
 **Core pipeline:** for each snapshot view/mount request, we:
-1. Walk the committed parent chain in the BoltDB metadata store to collect the ordered list of layer storage IDs
-2. Map each storage ID → diffID via the per-snapshot `.diffid` sidecar files we write at `Commit` time
-3. Find the corresponding content-store blob via `content.Manager.Walk` (matching `containerd.io/uncompressed == diffID`) -- or use the diffID directly if the blob is uncompressed
-4. Open gzip-compressed blobs via `gsip.NewReader` (the random-access gzip reader from `jonjohnsonjr/targz`) and plain tarballs directly
-5. Feed each `io.ReaderAt` into `tarfs.New` to get a seek-capable `fs.FS` over the tar entries
-6. Stack the per-layer `fs.FS` instances into a `LayeredFS` that implements whiteout semantics
-7. Mount the `LayeredFS` as a FUSE filesystem via `cpuguy83/go2fuse` (which adapts `io/fs.FS` to hanwen/go-fuse)
-8. Return the FUSE mount point as a bind mount to containerd
+1. Extract the topChainID from the parent snapshot's backend key (last `"/"` component)
+2. Call `buildLayerStack(topChainID)` to find all layer blobs from base to topChainID
+3. Open each blob: gzip layers via `gsip.NewReader` or `bytes.Buffer`; plain tarballs directly
+4. Feed each `io.ReaderAt` into `tarfs.New` to get a seek-capable `fs.FS` over the tar entries
+5. Stack the per-layer `fs.FS` instances into a `LayeredFS` that implements whiteout semantics
+6. Mount the `LayeredFS` as a FUSE filesystem via `cpuguy83/go2fuse` (which adapts `io/fs.FS` to hanwen/go-fuse)
+7. Return the FUSE mount point as a bind mount (View) or as the lowerdir of an overlayfs mount (Active/writable)
 
 **Snapshot kinds:**
-- `Prepare` (writable active) -- creates a tmpdir for the upper layer and, if a parent exists, starts a FUSE mount for the read-only parent chain.  Returns an overlayfs mount using the FUSE directory as lowerdir.  Writes during extraction go to the tmpdir and are ignored at `Commit` time; the content-store blob is the source of truth for future reads.
-- `View` (read-only active) -- starts a FUSE mount for the full parent chain and returns a bind mount with `ro`.
-- `Commit` -- records the snapshot's `containerd.io/snapshot/diff-id` label into a `<storage-id>.diffid` sidecar file, then calls `storage.CommitActive`.
+- `Prepare` (writable active) -- calls `buildLayerStack`, mounts FUSE, creates `upper/` and `work/` dirs, returns `type: overlay` with FUSE as lowerdir.  Extraction snapshots return empty mounts so containerd can extract into a throwaway temp dir.
+- `View` (read-only active) -- calls `buildLayerStack`, mounts FUSE, returns a `ro` bind mount.
+- `Commit` -- records kind and parent chain in memory; propagates chain info for Docker init-layer continuity.
 
-**DiffID sidecar files** live at `<state-root>/meta/<storage-id>.diffid`.  They bridge the gap between the BoltDB parent-chain storage IDs (opaque integers) and the content-store blob lookup -- without these we would need an O(n) BoltDB Walk for every mount request.
+**Layer→blob mapping** (`buildLayerStack`): walks content-store blobs labeled `containerd.io/gc.ref.content.config` (image manifests), parses each manifest's config `rootfs.diff_ids`, recomputes the OCI chain formula (`chainID[i] = sha256(chainID[i-1] + " " + diffID[i])`) to find which layer index matches topChainID, and collects all layer blobs from base up to that index.  Found blobs are labeled `tianon.xyz/values-conflict/tarfs/chain-id = chainID` for fast future lookup.  Three-pass fallback: labeled manifests → all blobs → chainID formula (for docker commit/build layers whose manifests aren't labeled).
 
 **FUSE mount lifecycle:**
-- Mounts live at `<state-root>/mounts/<snapshot-key>/`
-- Active mounts are tracked in an in-process map; on restart the process remounts any views/actives that are still live in the metadata DB
+- Mounts live at `<state-root>/mounts/<sha256(key)>/`
+- Active mounts tracked in-process; View/Active snapshots do NOT survive process restarts (FUSE mounts are gone, FUSE directories are stale)
 - `Remove` unmounts and removes the mount directory
 
 ## Key dependencies
@@ -98,7 +97,11 @@ The containerd v2 project splits its API (gRPC-generated protobuf stubs) into a 
 
 **Extraction EPERM (lchown):** in non-root environments, `archive.Apply` fails when the tar has UID=0 entries because `os.Lchown(path, 0, 0)` returns EPERM.  `archive.WithNoSameOwner()` would fix it but there's no way to inject it from outside the applier.  The `skipExtraction` approach (pre-commit without running extraction) avoids this but also skips the blob fetch.  Resolution: needs root or CAP_SYS_ADMIN for real image pulls; integration tests use manually-ingested blobs.
 
-**`containerd.io/uncompressed` label:** this label is set on the compressed blob by the unpacker AFTER successful extraction.  It cannot be used in `openLayerByDiffID` as a fast path because extraction hasn't happened when we first call it.  We fall back to `findCompressedBlob` which walks image manifests using their `containerd.io/gc.ref.content.l.N` → config → `rootfs.diff_ids` chain.
+**`containerd.io/uncompressed` label:** this label is set on the compressed blob by the unpacker after successful extraction.  `buildLayerStack` uses the manifest walk (not this label) to find layer blobs, which avoids depending on extraction timing.  The label IS used by `findBlobByDiffID` (the test path for uncompressed blobs) and by `findNewLayerBlob` (the chainID-formula fallback for docker commit/build layers).
+
+**BuildKit snapshot ordering (Commit-before-diff):** BuildKit calls `Commit` on our proxy BEFORE computing the diff blob for the new image layer.  After Commit, BuildKit creates a `View` of the committed snapshot and diffs it against the parent to produce the layer tar.  Our Commit was calling `stopMount` (unmounting FUSE), so the View fell back to serving only the parent's OCI layers -- the diff came out empty, and the new layer blob had no files.  Fix: preserve the active snapshot's `upperDir` in `upperDirs` at Commit time so that any subsequent View of the committed snapshot includes the new files as the top layer.  The classic builder (`DOCKER_BUILDKIT=0`) does NOT have this issue because it computes the diff from the overlay's upper dir directly before calling Commit.
+
+**BuildKit layer compression:** BuildKit produces zstd-compressed layers (`application/vnd.oci.image.layer.v1.tar+zstd`, magic `0x28 0xB5 0x2F 0xFD`) while the classic builder produces gzip.  Failing to detect zstd causes `tarfs.New` to silently parse the compressed frame as an uncompressed tar, returning an empty FS with no error.
 
 **gsip and random-access reads:** `gsip.NewReader` builds gzip checkpoints asynchronously via a goroutine.  `tarfs.New` triggers the initial sequential scan.  The goroutine may not finish receiving all checkpoints before `ReadAt` is called for random access.  For tests, use uncompressed tar blobs (diffID == blob digest, no gsip needed) to test the fast path.  Real production images (gzip layers) work correctly as long as the sequential scan completes before concurrent reads begin -- which is the normal FUSE mount case.
 
@@ -128,42 +131,30 @@ $ go test -exec "unshare --user --map-root-user --mount" ./...
 
 ## gsip (gzip random-access) notes
 
-`gsip.NewReader` builds deflate checkpoints asynchronously in a goroutine.  For small gzip blobs (< 4 MiB compressed) there is typically only one deflate block and zero checkpoints, making `ReadAt` fail for any non-zero offset.  We decompress these blobs entirely into a `bytes.Buffer` in `openLayerByDiffID`.  Blobs ≥ 4 MiB use gsip with a `runtime.Gosched()` call after `tarfs.New` to let the checkpoint goroutine drain.
+`gsip.NewReader` builds deflate checkpoints asynchronously in a goroutine.  For small gzip blobs (< 4 MiB compressed) there is typically only one deflate block and zero checkpoints, making `ReadAt` fail for any non-zero offset.  `openBlobAsFS` decompresses these blobs entirely into a `bytes.Buffer`.  Blobs ≥ 4 MiB use gsip with a `runtime.Gosched()` call after `tarfs.New` to let the checkpoint goroutine drain.
 
 ## Content store access
 
 The proxy snapshotter must connect back to containerd's gRPC socket (not directly open the metadata BoltDB) to read content store labels like `containerd.io/uncompressed`.  Direct BoltDB access would block on containerd's exclusive flock.  The gRPC content proxy requires the containerd namespace in the outgoing gRPC context; `propagateNamespace(ctx)` converts the incoming namespace from the snapshot RPC into an outgoing header for content store calls.
 
-## Current status (2026-06-11)
+## Current status (2026-06-16)
 
-**Phase:** core logic working and tested; `tianon/true:oci` works end-to-end; `bash:latest` blocked by GID mapping limitation in dev environment.
+**Phase:** working end-to-end in CI across all supported containerd versions; `docker run`, `docker build` (classic and BuildKit), and `docker commit` all pass.
 
 **Done:**
-- Cloned reference repos into `.tmp/`
-- Full `Snapshotter` implementation with gRPC proxy server and BoltDB metadata
-- `LayeredFS` with correct OCI whiteout semantics; 4 unit tests pass
-- `findCompressedBlob` walks image manifests to resolve diffID → compressed blob without the `containerd.io/uncompressed` label (which isn't set when we skip extraction)
-- `openLayerByDiffID` fast path (uncompressed blob at diffID address), labeled-blob path, and manifest-walk path; 3 integration tests pass
-- `TestOpenLayerByDiffID_multiLayer` verifies end-to-end: content store → tarfs → LayeredFS with whiteouts
-- Binary compiles and gRPC server starts; containerd connects to our proxy socket and sees `io.containerd.snapshotter.v1.tarfs` plugin
-- Transfer service unpack config properly wired in `containerd-base.toml` (`[[plugins.'io.containerd.transfer.v1.local'.unpack_config]]`)
-- Image pulls reach our Prepare correctly with diffID labels set
-- Empty-mount extraction approach verified: avoids bind mount EPERM and lets blobs be fetched
-- **`tianon/true:oci` pulls, mounts, and serves files via FUSE correctly** -- `/true` executes with exit 0, ELF magic bytes verified, file listing correct
-- gsip small-blob fix: blobs < 4 MiB are decompressed to `bytes.Buffer` for reliable random access
-- FUSE test (`TestFUSEMount_singleLayer`) passes under `unshare --user --map-root-user --mount`
-- Content store access via gRPC proxy with namespace propagation
+- `LayeredFS` with correct OCI whiteout semantics; unit tests pass
+- `TestFUSEMount_singleLayer` passes under `unshare --user --map-root-user --mount`
+- `openLayerByDiffID` with fast path (uncompressed blob at diffID address) and manifest-walk path; integration tests pass
+- Empty-mount extraction: avoids bind mount EPERM, lets blobs stay in content store
+- gsip small-blob fix: blobs < 4 MiB decompressed to `bytes.Buffer` for reliable random access
+- BoltDB/MetaStore eliminated entirely: no `metadata.db`; snapshot kinds and parent chains are in-memory; layer→blob mapping lives as `tianon.xyz/values-conflict/tarfs/chain-id` labels on content-store blobs
+- `buildLayerStack` derives the full ordered layer stack from content-store manifests; three-pass fallback (labeled manifests → all blobs → chainID formula) covers normal pulls, `docker commit`, and BuildKit builds
+- Docker daemon integration: `docker run`, `docker build` (classic and BuildKit), `docker commit`, cross-arch runs all pass in CI
+- `bash:latest`, cross-arch `bash:latest` (arm64), and various `tianon/test:badtars-*` images all tested
 
-**Blocked in dev environment (not in production):**
-- `bash:latest` extraction fails: `/etc/shadow` has GID=42 (shadow group), which is not in the single-pair user namespace GID map (`--map-root-user` maps only GID 0).  Multi-GID mapping requires `newuidmap`/`newgidmap` (not installed) or root.
-- Overlayfs with a FUSE lowerdir (for writable container roots) not yet tested
-
-**Next steps:**
-- Test `bash:latest` on a host with proper UID/GID subordinate mappings or root access
-- Add gsip index caching (`<state-root>/gsip-index/<digest>`) for restart performance
-- Add tarfs TOC caching to speed up FUSE mount creation after restart
-- Write a `run-in-namespace.sh` wrapper script to simplify the `unshare` setup
-- Consider a `--no-extract` flag that uses skipExtraction when blobs are already in the content store (for pre-seeded scenarios)
+**Known limitations:**
+- Writable containers still use `type: overlay` with the FUSE directory as lowerdir; eliminating this requires a writable FUSE implementation (see `TODO.md`)
+- View/Active snapshot state is in-memory only -- containers and image mounts do not survive snapshotter process restarts
 
 ## Maintaining this file
 

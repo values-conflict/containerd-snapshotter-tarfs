@@ -131,8 +131,8 @@ func ingestBlob(t *testing.T, cs content.Store, data []byte, d digest.Digest, me
 	}
 }
 
-// labelBlob sets labels on a blob in the content store.
-func labelBlob(t *testing.T, cs content.Store, d digest.Digest, labels map[string]string) {
+// labelContentBlob sets labels on a blob in the content store.
+func labelContentBlob(t *testing.T, cs content.Store, d digest.Digest, labels map[string]string) {
 	t.Helper()
 	ctx := context.Background()
 	info, err := cs.Info(ctx, d)
@@ -225,7 +225,7 @@ func TestOpenLayerByDiffID_multiLayer(t *testing.T) {
 		manifestJSON := []byte(`{"schemaVersion":2,"config":{"digest":"` + configDigest.String() + `","size":` + strconv.Itoa(len(configJSON)) + `},"layers":[{"digest":"` + pair.blobDigest.String() + `","size":` + strconv.Itoa(len(pair.data)) + `}]}`)
 		manifestDigest := digest.Canonical.FromBytes(manifestJSON)
 		ingestBlob(t, cs, manifestJSON, manifestDigest, ocispec.MediaTypeImageManifest)
-		labelBlob(t, cs, manifestDigest, map[string]string{
+		labelContentBlob(t, cs, manifestDigest, map[string]string{
 			"containerd.io/gc.ref.content.config": configDigest.String(),
 			"containerd.io/gc.ref.content.l.0":    pair.blobDigest.String(),
 		})

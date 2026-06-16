@@ -1,27 +1,27 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"bytes"
-	"compress/gzip"
-	"encoding/json"
-	"io"
-
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
-	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/opencontainers/go-digest"
@@ -31,18 +31,30 @@ import (
 	gofusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/jonjohnsonjr/targz/gsip"
 	"github.com/jonjohnsonjr/targz/tarfs"
 )
 
+const (
+	labelNS          = "tianon.xyz/values-conflict/tarfs"
+	labelBlobChainID = labelNS + "/chain-id" // label on content-store blobs: chainID of the snapshot that uses this blob
+)
+
 // Snapshotter implements snapshots.Snapshotter by serving OCI image layers directly from the containerd content store via FUSE, without extraction.
+// All persistent state lives in the content store (blob labels) and the stateDir filesystem (FUSE mountpoints, overlay upper/work dirs).
+// Snapshot kinds and parent chains are tracked in-memory; View/Active snapshots do not survive process restarts.
 type Snapshotter struct {
 	root string
-	ms   *storage.MetaStore
 	cs   content.Store
 
-	mu     sync.Mutex
-	mounts map[string]*activeMount // snapshot key → live FUSE mount
+	mu           sync.Mutex
+	mounts       map[string]*activeMount // backend key → live FUSE mount
+	kinds        sync.Map                // backend key → snapshots.Kind
+	layerChains  sync.Map                // backend key → topChainID (View/Active with parents only)
+	parentChains sync.Map                // newChainID → parentChainID (for docker commit/build layers whose manifest isn't labeled)
+	upperDirs    sync.Map                // committed snapshot name → upperDir path; set when an active snapshot with changes is committed so Views of it can serve the changes
 }
 
 // activeMount tracks a live FUSE server for a single snapshot.
@@ -55,68 +67,52 @@ type activeMount struct {
 
 // NewSnapshotter creates a Snapshotter rooted at stateDir using cs for layer blob access.  stateDir will be created if it does not exist.
 func NewSnapshotter(ctx context.Context, stateDir string, cs content.Store) (*Snapshotter, error) {
-	for _, sub := range []string{".", "meta", "mounts", "upper", "work"} {
+	for _, sub := range []string{".", "mounts", "upper", "work"} {
 		if err := os.MkdirAll(filepath.Join(stateDir, sub), 0o700); err != nil {
 			return nil, fmt.Errorf("creating state dir %q: %w", filepath.Join(stateDir, sub), err)
 		}
 	}
+	return &Snapshotter{root: stateDir, cs: cs, mounts: map[string]*activeMount{}}, nil
+}
 
-	ms, err := storage.NewMetaStore(filepath.Join(stateDir, "metadata.db"))
-	if err != nil {
-		return nil, fmt.Errorf("opening metadata store: %w", err)
-	}
-
-	return &Snapshotter{
-		root:   stateDir,
-		ms:     ms,
-		cs:     cs,
-		mounts: map[string]*activeMount{},
-	}, nil
+// keyPath converts a snapshot key to a path-safe directory basename.
+// Snapshot keys may contain slashes, colons, and other characters unsuitable for paths.
+func keyPath(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("%x", sum)
 }
 
 // --- snapshots.Snapshotter interface ---
 
-func (s *Snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info, err error) {
-	err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		_, info, _, err = storage.GetInfo(ctx, key)
-		return err
-	})
-	return info, err
+func (s *Snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {
+	kind := snapshots.KindCommitted
+	if v, ok := s.kinds.Load(key); ok {
+		kind = v.(snapshots.Kind)
+	}
+	return snapshots.Info{Kind: kind}, nil
 }
 
-func (s *Snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (updated snapshots.Info, err error) {
-	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		updated, err = storage.UpdateInfo(ctx, info, fieldpaths...)
-		return err
-	})
-	return updated, err
+func (s *Snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
+	// containerd's own metadata BoltDB stores all snapshot labels; we have nothing to update
+	return s.Stat(ctx, info.Name)
 }
 
-func (s *Snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage, err error) {
-	var usage snapshots.Usage
-	err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		_, _, usage, err = storage.GetInfo(ctx, key)
-		return err
-	})
-	return usage, err
+func (s *Snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
+	return snapshots.Usage{}, nil
 }
 
 func (s *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
-	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+	return s.createSnapshot(ctx, snapshots.KindActive, key, parent)
 }
 
 func (s *Snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
-	return s.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
+	return s.createSnapshot(ctx, snapshots.KindView, key, parent)
 }
 
 func (s *Snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, error) {
-	var snap storage.Snapshot
-	var err error
-	if err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		snap, err = storage.GetSnapshot(ctx, key)
-		return err
-	}); err != nil {
-		return nil, fmt.Errorf("getting snapshot %q: %w", key, err)
+	kind := snapshots.KindView
+	if v, ok := s.kinds.Load(key); ok {
+		kind = v.(snapshots.Kind)
 	}
 
 	s.mu.Lock()
@@ -124,45 +120,67 @@ func (s *Snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 	s.mu.Unlock()
 
 	if am == nil {
-		// mount not live (process restart, or View after Mounts call gap) -- rebuild
-		newMount, err := s.buildMount(ctx, key, snap)
+		// mount not live -- rebuild if we have the chain info (fails after restart by design)
+		topChainID, ok := s.layerChains.Load(key)
+		if !ok {
+			return nil, fmt.Errorf("snapshot %q not in memory (process restart requires re-mount): %w", key, errdefs.ErrNotFound)
+		}
+		var err error
+		am, err = s.buildMount(ctx, key, kind, topChainID.(string), "")
 		if err != nil {
 			return nil, err
 		}
 		s.mu.Lock()
-		s.mounts[key] = newMount
+		s.mounts[key] = am
 		s.mu.Unlock()
-		am = newMount
 	}
 
-	return s.mountsFor(snap, am), nil
+	return s.mountsFor(key, kind, am), nil
 }
 
 func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
-	// resolve the blob digest before taking the write lock (content store I/O is fine here)
-	blobDigest := s.resolveBlob(ctx, name)
-
-	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		id, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, opts...)
-		if err != nil {
-			return fmt.Errorf("committing snapshot %q as %q: %w", key, name, err)
+	s.kinds.Store(name, snapshots.KindCommitted)
+	s.kinds.Delete(key)
+	// propagate layer chain through init layers (Docker commits an init snapshot on top of the image layers; its committed name isn't a valid chainID digest, but its parent IS)
+	if chain, ok := s.layerChains.Load(key); ok {
+		s.layerChains.Store(name, chain)
+		// record newChainID → parentChainID for the blob-level fallback in buildLayerStack
+		chainID := name[strings.LastIndex(name, "/")+1:]
+		if _, err := digest.Parse(chainID); err == nil && chainID != chain.(string) {
+			s.parentChains.Store(chainID, chain.(string))
 		}
+	}
+	s.layerChains.Delete(key)
 
-		// write sidecar so we can map storage ID → blob at mount time
-		if blobDigest != "" {
-			if err := s.writeBlob(id, blobDigest.String()); err != nil {
-				return fmt.Errorf("writing blob sidecar for %q: %w", id, err)
-			}
-		} else {
-			log.Printf("tarfs: Commit %q: no blob resolved, layer will not be mountable", name)
+	s.mu.Lock()
+	am := s.mounts[key]
+	delete(s.mounts, key)
+	s.mu.Unlock()
+
+	if am != nil {
+		// preserve the upper dir so Views of this committed snapshot can diff it correctly; BuildKit calls Commit before computing the diff blob, then creates a View
+		if am.upperDir != "" {
+			s.upperDirs.Store(name, am.upperDir)
 		}
-
-		return nil
-	}); err != nil {
-		return err
+		s.stopMount(am)
 	}
 
-	// clean up the active mount now that we have committed
+	if chainID := name[strings.LastIndex(name, "/")+1:]; chainID == "" {
+		log.Printf("tarfs: Commit %q: could not extract chainID from name", name)
+	} else {
+		log.Printf("tarfs: Commit %q (chainID %s)", name, chainID)
+	}
+
+	return nil
+}
+
+func (s *Snapshotter) Remove(ctx context.Context, key string) error {
+	s.kinds.Delete(key)
+	s.layerChains.Delete(key)
+	if v, ok := s.upperDirs.LoadAndDelete(key); ok {
+		_ = os.RemoveAll(v.(string))
+	}
+
 	s.mu.Lock()
 	am := s.mounts[key]
 	delete(s.mounts, key)
@@ -172,55 +190,88 @@ func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		s.stopMount(am)
 	}
 
+	id := keyPath(key)
+	_ = os.RemoveAll(filepath.Join(s.root, "upper", id))
+	_ = os.RemoveAll(filepath.Join(s.root, "work", id))
+
 	return nil
 }
 
-// resolveBlob returns the compressed blob digest for the snapshot being committed.
-// containerd wraps committed snapshot names as "namespace/seq/chainID"; the last component
-// is the OCI chainID, which uniquely identifies the layer's position in its chain.
-//
-// Fast path: for uncompressed blobs (tests; layer 0 where chainID == diffID == blob digest)
-// the blob lives at the chainID address itself in the content store.
-//
-// Main path: walk image manifests.  Manifests are fetched before layer extraction begins in
-// all containerd versions and pull paths, so they are always present at Commit time.  For each
-// manifest the image config provides rootfs.diff_ids; recomputing the OCI chain formula
-// identifies which layer index matches our chainID, and the manifest's Layers[i].Digest is
-// the compressed blob we want to cache.  This works across all containerd versions without
-// depending on opts labels or the timing of containerd.io/uncompressed.
-func (s *Snapshotter) resolveBlob(ctx context.Context, name string) digest.Digest {
-	pctx := propagateNamespace(ctx)
-	// containerd wraps names as "namespace/seq/chainID"; the last component is the chainID
-	chainID := name[strings.LastIndex(name, "/")+1:]
-
-	// fast path: uncompressed blob lives at its own digest (layer 0: chainID == diffID)
-	if d, err := digest.Parse(chainID); err == nil {
-		if _, csErr := s.cs.Info(pctx, d); csErr == nil {
-			return d
+func (s *Snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters ...string) error {
+	var walkErr error
+	s.kinds.Range(func(k, v any) bool {
+		if err := fn(ctx, snapshots.Info{Name: k.(string), Kind: v.(snapshots.Kind)}); err != nil {
+			walkErr = err
+			return false
 		}
-	}
-
-	return s.findBlobByChainID(pctx, chainID)
+		return true
+	})
+	return walkErr
 }
 
-// findBlobByChainID walks image manifests in the content store to find the compressed blob
-// digest for the layer identified by chainID.  For each blob with a
-// containerd.io/gc.ref.content.config label (an image manifest), it reads the manifest JSON
-// to get the layer descriptors and the image config to get rootfs.diff_ids, then recomputes
-// the OCI chainID chain until it finds a match.
-func (s *Snapshotter) findBlobByChainID(ctx context.Context, chainID string) digest.Digest {
-	var result digest.Digest
-	if err := s.cs.Walk(ctx, func(info content.Info) error {
-		if info.Labels["containerd.io/gc.ref.content.config"] == "" {
-			return nil
-		}
+func (s *Snapshotter) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, am := range s.mounts {
+		s.stopMount(am)
+	}
+	s.mounts = map[string]*activeMount{}
+	return nil
+}
 
-		manifestRA, err := s.cs.ReaderAt(ctx, ocispec.Descriptor{Digest: info.Digest})
-		if err != nil {
+// findNewLayerBlob finds the compressed blob for a new layer by walking blobs with containerd.io/uncompressed labels and checking whether sha256(parentChainID + " " + uncompressed_digest) == newChainID.  Used as a fallback for docker commit/build images whose manifest isn't labeled.
+func (s *Snapshotter) findNewLayerBlob(ctx context.Context, parentChainID, newChainID string) digest.Digest {
+	var result digest.Digest
+	_ = s.cs.Walk(ctx, func(info content.Info) error {
+		diffIDStr := info.Labels["containerd.io/uncompressed"]
+		if diffIDStr == "" {
 			return nil
 		}
-		manifestData, err := io.ReadAll(io.NewSectionReader(manifestRA, 0, manifestRA.Size()))
-		manifestRA.Close()
+		if digest.Canonical.FromString(parentChainID+" "+diffIDStr).String() == newChainID {
+			result = info.Digest
+		}
+		return nil
+	}, `labels."containerd.io/uncompressed"`)
+	return result
+}
+
+// findBlobByDiffID returns the compressed blob digest for the given diffID.
+// For uncompressed blobs (e.g. in tests) the blob lives at the diffID address itself.
+// For compressed blobs the digest is found via the containerd.io/uncompressed label.
+func (s *Snapshotter) findBlobByDiffID(ctx context.Context, diffIDStr string) digest.Digest {
+	diffID, err := digest.Parse(diffIDStr)
+	if err != nil {
+		return ""
+	}
+	// fast path: uncompressed blob stored at its own digest
+	if _, err := s.cs.Info(ctx, diffID); err == nil {
+		return diffID
+	}
+	// compressed blob labeled with containerd.io/uncompressed=diffID
+	var result digest.Digest
+	_ = s.cs.Walk(ctx, func(info content.Info) error {
+		result = info.Digest
+		return nil
+	}, `labels."containerd.io/uncompressed"==`+strconv.Quote(diffIDStr))
+	return result
+}
+
+// --- internal helpers ---
+
+// buildLayerStack walks image manifests to find all layers up to and including topChainID, opens each as an fs.FS, and returns them bottom-first.  It also labels each blob with labelBlobChainID for fast future lookup.
+func (s *Snapshotter) buildLayerStack(ctx context.Context, topChainID string) ([]fs.FS, error) {
+	type layerBlob struct {
+		blobDigest digest.Digest
+		chainID    string
+	}
+	var layers []layerBlob
+
+	// tryManifest attempts to parse info as an OCI manifest and, if it contains topChainID in its layer chain, populates layers with the full ordered set.
+	tryManifest := func(info content.Info) error {
+		if layers != nil {
+			return nil
+		}
+		manifestData, err := s.readContentBlob(ctx, info.Digest)
 		if err != nil {
 			return nil
 		}
@@ -239,12 +290,7 @@ func (s *Snapshotter) findBlobByChainID(ctx context.Context, chainID string) dig
 			return nil
 		}
 
-		configRA, err := s.cs.ReaderAt(ctx, ocispec.Descriptor{Digest: manifest.Config.Digest})
-		if err != nil {
-			return nil
-		}
-		configData, err := io.ReadAll(io.NewSectionReader(configRA, 0, configRA.Size()))
-		configRA.Close()
+		configData, err := s.readContentBlob(ctx, manifest.Config.Digest)
 		if err != nil {
 			return nil
 		}
@@ -267,112 +313,93 @@ func (s *Snapshotter) findBlobByChainID(ctx context.Context, chainID string) dig
 			} else {
 				chain = digest.Canonical.FromString(chain.String() + " " + diffID.String())
 			}
-			if chain.String() == chainID {
-				result = manifest.Layers[i].Digest
+			if chain.String() == topChainID {
+				var collected []layerBlob
+				var c digest.Digest
+				for j, d := range config.RootFS.DiffIDs[:i+1] {
+					if j == 0 {
+						c = d
+					} else {
+						c = digest.Canonical.FromString(c.String() + " " + d.String())
+					}
+					collected = append(collected, layerBlob{manifest.Layers[j].Digest, c.String()})
+				}
+				layers = collected
 				return nil
 			}
 		}
 		return nil
-	}); err != nil {
-		log.Printf("tarfs: findBlobByChainID: content store walk error: %v", err)
 	}
-	return result
-}
 
-// findBlobByDiffID returns the compressed blob digest for the given diffID.
-// For uncompressed blobs (e.g. in tests) the blob lives at the diffID address itself.
-// For compressed blobs the digest is found via the containerd.io/uncompressed label.
-func (s *Snapshotter) findBlobByDiffID(ctx context.Context, diffIDStr string) digest.Digest {
-	diffID, err := digest.Parse(diffIDStr)
-	if err != nil {
-		return ""
+	// first pass: only labeled manifests (fast -- covers normal image pulls)
+	if err := s.cs.Walk(ctx, tryManifest, `labels."containerd.io/gc.ref.content.config"`); err != nil {
+		return nil, fmt.Errorf("searching manifests for chainID %s: %w", topChainID, err)
 	}
-	// fast path: uncompressed blob stored at its own digest
-	if _, err := s.cs.Info(ctx, diffID); err == nil {
-		return diffID
+	if layers != nil {
+		log.Printf("tarfs: buildLayerStack %s: found via labeled manifest (%d layers)", topChainID, len(layers))
 	}
-	// compressed blob labeled with containerd.io/uncompressed=diffID
-	var result digest.Digest
-	_ = s.cs.Walk(ctx, func(info content.Info) error {
-		if info.Labels["containerd.io/uncompressed"] == diffIDStr {
-			result = info.Digest
+
+	// second pass: all blobs (covers docker commit images whose manifest isn't labeled)
+	if layers == nil {
+		_ = s.cs.Walk(ctx, tryManifest)
+		if layers != nil {
+			log.Printf("tarfs: buildLayerStack %s: found via unlabeled manifest (%d layers)", topChainID, len(layers))
 		}
-		return nil
-	})
-	return result
-}
-
-func (s *Snapshotter) Remove(ctx context.Context, key string) error {
-	var id string
-	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		var err error
-		id, _, err = storage.Remove(ctx, key)
-		return err
-	}); err != nil {
-		return fmt.Errorf("removing snapshot %q: %w", key, err)
 	}
 
-	s.mu.Lock()
-	am := s.mounts[key]
-	delete(s.mounts, key)
-	s.mu.Unlock()
-
-	if am != nil {
-		s.stopMount(am)
+	if layers == nil {
+		// fast path: single-layer uncompressed blob (tests; chainID == diffID == blob digest)
+		if d, err := digest.Parse(topChainID); err == nil {
+			if _, csErr := s.cs.Info(ctx, d); csErr == nil {
+				layers = []layerBlob{{d, topChainID}}
+			}
+		}
 	}
 
-	// clean up state directories
-	_ = os.RemoveAll(filepath.Join(s.root, "upper", id))
-	_ = os.RemoveAll(filepath.Join(s.root, "work", id))
-	_ = os.Remove(s.blobPath(id))
-
-	return nil
-}
-
-func (s *Snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters ...string) error {
-	return s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		return storage.WalkInfo(ctx, fn, filters...)
-	})
-}
-
-func (s *Snapshotter) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, am := range s.mounts {
-		s.stopMount(am)
-	}
-	s.mounts = map[string]*activeMount{}
-	return s.ms.Close()
-}
-
-// --- internal helpers ---
-
-func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
-	var snap storage.Snapshot
-
-	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		var txErr error
-		snap, txErr = storage.CreateSnapshot(ctx, kind, key, parent, opts...)
-		return txErr
-	}); err != nil {
-		return nil, fmt.Errorf("creating snapshot %q: %w", key, err)
+	if layers == nil {
+		// third fallback: reconstruct from parentChains map (populated in Commit for docker commit/build layers).
+		// walks containerd.io/uncompressed blobs to find the new layer blob via the chainID formula.
+		if parentChainID, ok := s.parentChains.Load(topChainID); ok {
+			log.Printf("tarfs: buildLayerStack %s: trying parentChains fallback (parent %s)", topChainID, parentChainID.(string))
+			if parentFSLayers, err2 := s.buildLayerStack(ctx, parentChainID.(string)); err2 == nil {
+				if newBlob := s.findNewLayerBlob(ctx, parentChainID.(string), topChainID); newBlob != "" {
+					log.Printf("tarfs: buildLayerStack %s: found via parentChains+findNewLayerBlob", topChainID)
+					pctx2 := propagateNamespace(context.WithoutCancel(ctx))
+					_, _ = s.cs.Update(pctx2, content.Info{
+						Digest: newBlob,
+						Labels: map[string]string{labelBlobChainID: topChainID},
+					}, "labels."+labelBlobChainID)
+					if newFS, err3 := s.openBlobAsFS(ctx, newBlob); err3 == nil {
+						return append(parentFSLayers, newFS), nil // bottom-first; new layer at end
+					}
+				}
+			}
+		}
 	}
 
-	am, err := s.buildMount(ctx, key, snap)
-	if err != nil {
-		// roll back the metadata entry
-		_ = s.ms.WithTransaction(context.Background(), true, func(ctx context.Context) error {
-			_, _, _ = storage.Remove(ctx, key)
-			return nil
-		})
-		return nil, err
+	if layers == nil {
+		return nil, fmt.Errorf("no manifest found for chainID %s: %w", topChainID, errdefs.ErrNotFound)
 	}
 
-	s.mu.Lock()
-	s.mounts[key] = am
-	s.mu.Unlock()
-
-	return s.mountsFor(snap, am), nil
+	// open each layer blob and cache its chainID label for future fast lookup
+	log.Printf("tarfs: buildLayerStack %s: opening %d layers", topChainID, len(layers))
+	pctx := propagateNamespace(context.WithoutCancel(ctx))
+	fsLayers := make([]fs.FS, len(layers))
+	for i, layer := range layers {
+		log.Printf("tarfs: buildLayerStack %s: layer[%d] chainID=%s blob=%s", topChainID, i, layer.chainID, layer.blobDigest)
+		if _, err := s.cs.Update(pctx, content.Info{
+			Digest: layer.blobDigest,
+			Labels: map[string]string{labelBlobChainID: layer.chainID},
+		}, "labels."+labelBlobChainID); err != nil {
+			log.Printf("tarfs: caching blob label for chainID %s: %v (continuing)", layer.chainID, err)
+		}
+		fsys, err := s.openBlobAsFS(ctx, layer.blobDigest)
+		if err != nil {
+			return nil, fmt.Errorf("opening layer blob %s: %w", layer.blobDigest, err)
+		}
+		fsLayers[i] = fsys
+	}
+	return fsLayers, nil
 }
 
 // isExtractionKey reports whether key was created by the containerd unpacker for layer extraction.
@@ -385,79 +412,79 @@ func isExtractionKey(key string) bool {
 	return strings.HasPrefix(key, snapshots.UnpackKeyPrefix)
 }
 
-// buildMount constructs (or rebuilds) the mount setup for snapshot snap.
+// buildMount constructs (or rebuilds) the mount setup for a snapshot.
 //
 // For extraction-type snapshots we return empty mounts so containerd extracts the layer tar into a throwaway temp dir (to compute and verify the DiffID) without requiring a bind mount syscall.  The blob stays in the content store and is read at FUSE mount time.
 //
 // For container-serving snapshots (View / non-extraction Prepare) we attempt to mount the parent layer chain via FUSE.  If FUSE is unavailable in this environment the snapshot is still created and the mounts are returned, but they point at an empty directory.  Container filesystems will be empty in that degraded mode -- the implementation is correct, it just needs FUSE to actually serve content.
-func (s *Snapshotter) buildMount(ctx context.Context, key string, snap storage.Snapshot) (*activeMount, error) {
+func (s *Snapshotter) buildMount(ctx context.Context, key string, kind snapshots.Kind, topChainID, committedUpperDir string) (*activeMount, error) {
 	am := &activeMount{}
 
 	extraction := isExtractionKey(key)
-	if extraction && snap.Kind == snapshots.KindActive {
+	if extraction && kind == snapshots.KindActive {
 		// return empty mounts: extraction runs into containerd's throwaway temp dir
 		return am, nil
 	}
 
-	// build the FUSE layer stack from committed parents
-	if len(snap.ParentIDs) > 0 && !extraction {
-		var fsLayers []fs.FS
-		for i := len(snap.ParentIDs) - 1; i >= 0; i-- {
-			layerFS, err := s.openLayerByID(ctx, snap.ParentIDs[i])
-			if err != nil {
-				return nil, fmt.Errorf("opening layer for storage id %q: %w", snap.ParentIDs[i], err)
-			}
-			fsLayers = append(fsLayers, layerFS)
-		}
+	if topChainID != "" && !extraction {
+		pctx := propagateNamespace(ctx)
 
-		// fsLayers is bottom-first; LayeredFS wants top-first
-		if len(fsLayers) > 1 {
-			for i, j := 0, len(fsLayers)-1; i < j; i, j = i+1, j-1 {
-				fsLayers[i], fsLayers[j] = fsLayers[j], fsLayers[i]
-			}
-		}
-
-		var merged fs.FS
-		if len(fsLayers) == 1 {
-			merged = fsLayers[0]
-		} else {
-			merged = &LayeredFS{layers: fsLayers}
-		}
-
-		// use the storage ID (numeric) for the mount dir so snapshot keys
-		// containing slashes or colons (eg sha256:abc...) stay path-safe
-		mountpoint := filepath.Join(s.root, "mounts", snap.ID)
-		if err := os.MkdirAll(mountpoint, 0o755); err != nil {
-			return nil, fmt.Errorf("creating mountpoint %q: %w", mountpoint, err)
-		}
-
-		// the tarfs content is immutable (fixed tar archive), so it is safe to
-		// cache FUSE dentries and attrs indefinitely -- the kernel default of 1s
-		// causes ESTALE when overlayfs tries to reconstruct expired dentries via
-		// d_real() without CAP_EXPORT_SUPPORT, breaking ctr run
-		forever := time.Duration(math.MaxInt64)
-		server, err := go2fuse.Mount(mountpoint, merged, &gofusefs.Options{
-			EntryTimeout: &forever,
-			AttrTimeout:  &forever,
-			MountOptions: fuse.MountOptions{
-				AllowOther: true,
-				FsName:     "tarfs",
-				Name:       "tarfs",
-			},
-		})
+		fsLayers, err := s.buildLayerStack(pctx, topChainID)
 		if err != nil {
-			// FUSE unavailable: log and continue in degraded mode -- mounts
-			// will point at the empty mountpoint directory
-			log.Printf("tarfs: FUSE mount unavailable for %q: %v (serving empty directory)", key, err)
+			log.Printf("tarfs: buildLayerStack for %q: %v (serving empty directory)", key, err)
 		} else {
-			am.server = server
+			// committedUpperDir (if set) is the top layer: content written by a build container whose active snapshot was committed before BuildKit computed its diff blob
+			if committedUpperDir != "" {
+				fsLayers = append(fsLayers, os.DirFS(committedUpperDir)) // top layer goes at end (bottom-first)
+			}
+
+			// buildLayerStack returns bottom-first; LayeredFS wants top-first
+			if len(fsLayers) > 1 {
+				for i, j := 0, len(fsLayers)-1; i < j; i, j = i+1, j-1 {
+					fsLayers[i], fsLayers[j] = fsLayers[j], fsLayers[i]
+				}
+			}
+
+			var merged fs.FS
+			if len(fsLayers) == 1 {
+				merged = fsLayers[0]
+			} else {
+				merged = &LayeredFS{layers: fsLayers}
+			}
+
+			mountpoint := filepath.Join(s.root, "mounts", keyPath(key))
+			if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+				return nil, fmt.Errorf("creating mountpoint %q: %w", mountpoint, err)
+			}
+
+			// the tarfs content is immutable (fixed tar archive), so it is safe to
+			// cache FUSE dentries and attrs indefinitely -- the kernel default of 1s
+			// causes ESTALE when overlayfs tries to reconstruct expired dentries via
+			// d_real() without CAP_EXPORT_SUPPORT, breaking ctr run
+			forever := time.Duration(math.MaxInt64)
+			server, err := go2fuse.Mount(mountpoint, merged, &gofusefs.Options{
+				EntryTimeout: &forever,
+				AttrTimeout:  &forever,
+				MountOptions: fuse.MountOptions{
+					AllowOther: true,
+					FsName:     "tarfs",
+					Name:       "tarfs",
+				},
+			})
+			if err != nil {
+				// FUSE unavailable: log and continue in degraded mode -- mounts
+				// will point at the empty mountpoint directory
+				log.Printf("tarfs: FUSE mount unavailable for %q: %v (serving empty directory)", key, err)
+			} else {
+				am.server = server
+			}
+			am.mountpoint = mountpoint
 		}
-		am.mountpoint = mountpoint
 	}
 
-	if snap.Kind == snapshots.KindActive {
-		upperDir := filepath.Join(s.root, "upper", snap.ID)
-		workDir := filepath.Join(s.root, "work", snap.ID)
+	if kind == snapshots.KindActive {
+		upperDir := filepath.Join(s.root, "upper", keyPath(key))
+		workDir := filepath.Join(s.root, "work", keyPath(key))
 		if err := os.MkdirAll(upperDir, 0o755); err != nil {
 			return nil, fmt.Errorf("creating upper dir: %w", err)
 		}
@@ -471,17 +498,54 @@ func (s *Snapshotter) buildMount(ctx context.Context, key string, snap storage.S
 	return am, nil
 }
 
+func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string) (_ []mount.Mount, err error) {
+	s.kinds.Store(key, kind)
+
+	// extract topChainID from parent backend key ("namespace/seq/chainID")
+	topChainID := ""
+	if parent != "" {
+		candidate := parent[strings.LastIndex(parent, "/")+1:]
+		if _, err := digest.Parse(candidate); err == nil {
+			topChainID = candidate
+		} else if chain, ok := s.layerChains.Load(parent); ok {
+			// parent is a non-chainID key (e.g. Docker's init layer whose name ends in "-init"); inherit the image chain that was propagated through Commit
+			topChainID = chain.(string)
+		}
+		if topChainID != "" {
+			s.layerChains.Store(key, topChainID)
+		}
+	}
+
+	// if the parent is a committed snapshot that preserved an upper dir (BuildKit build containers), include that dir as the top layer so Views used for diff computation see the changes
+	committedUpperDir := ""
+	if v, ok := s.upperDirs.Load(parent); ok {
+		committedUpperDir = v.(string)
+	}
+
+	am, err := s.buildMount(ctx, key, kind, topChainID, committedUpperDir)
+	if err != nil {
+		s.kinds.Delete(key)
+		s.layerChains.Delete(key)
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.mounts[key] = am
+	s.mu.Unlock()
+
+	return s.mountsFor(key, kind, am), nil
+}
+
 // mountsFor returns the []mount.Mount instructions for the given snapshot.
-func (s *Snapshotter) mountsFor(snap storage.Snapshot, am *activeMount) []mount.Mount {
-	// extraction snapshot: return empty mounts so containerd can extract into
-	// a throwaway temp dir without any bind mount syscall
-	if snap.Kind == snapshots.KindActive && am.upperDir == "" && am.mountpoint == "" {
+func (s *Snapshotter) mountsFor(key string, kind snapshots.Kind, am *activeMount) []mount.Mount {
+	// extraction snapshot: return empty mounts so containerd can extract into a throwaway temp dir without any bind mount syscall
+	if kind == snapshots.KindActive && am.upperDir == "" && am.mountpoint == "" {
 		return nil
 	}
 
-	// no parents or no FUSE mount: just use the upper dir
-	if len(snap.ParentIDs) == 0 || am.mountpoint == "" {
-		if snap.Kind == snapshots.KindActive {
+	// no FUSE mount (no parents, or FUSE unavailable): use upper dir directly
+	if am.mountpoint == "" {
+		if kind == snapshots.KindActive {
 			return []mount.Mount{{
 				Type:    "bind",
 				Source:  am.upperDir,
@@ -489,7 +553,7 @@ func (s *Snapshotter) mountsFor(snap storage.Snapshot, am *activeMount) []mount.
 			}}
 		}
 		// view with no parents: synthetic empty bind mount
-		emptyDir := filepath.Join(s.root, "mounts", snap.ID)
+		emptyDir := filepath.Join(s.root, "mounts", keyPath(key))
 		_ = os.MkdirAll(emptyDir, 0o755)
 		return []mount.Mount{{
 			Type:    "bind",
@@ -498,7 +562,7 @@ func (s *Snapshotter) mountsFor(snap storage.Snapshot, am *activeMount) []mount.
 		}}
 	}
 
-	if snap.Kind == snapshots.KindView {
+	if kind == snapshots.KindView {
 		return []mount.Mount{{
 			Type:    "bind",
 			Source:  am.mountpoint,
@@ -506,8 +570,7 @@ func (s *Snapshotter) mountsFor(snap storage.Snapshot, am *activeMount) []mount.
 		}}
 	}
 
-	// KindActive with parents: overlayfs on top of the FUSE lowerdir
-	// (requires kernel ≥ 5.11 for FUSE as overlayfs lowerdir)
+	// KindActive with parents: overlayfs on top of the FUSE lowerdir (requires kernel ≥ 5.11 for FUSE as overlayfs lowerdir)
 	return []mount.Mount{{
 		Type:   "overlay",
 		Source: "overlay",
@@ -517,28 +580,6 @@ func (s *Snapshotter) mountsFor(snap storage.Snapshot, am *activeMount) []mount.
 			fmt.Sprintf("workdir=%s", am.workDir),
 		},
 	}}
-}
-
-// openLayerByID opens the layer blob for the committed snapshot with the given storage ID and returns it as an fs.FS.
-func (s *Snapshotter) openLayerByID(ctx context.Context, storageID string) (fs.FS, error) {
-	ctx = propagateNamespace(ctx)
-	blobDigestStr, err := s.readBlob(storageID)
-	if err != nil {
-		return nil, fmt.Errorf("reading blob for storage id %q: %w", storageID, err)
-	}
-	if blobDigestStr == "" {
-		// no blob (e.g. Docker's synthetic init layer written directly to the upper dir)
-		upperDir := filepath.Join(s.root, "upper", storageID)
-		if info, statErr := os.Stat(upperDir); statErr == nil && info.IsDir() {
-			return os.DirFS(upperDir), nil
-		}
-		return nil, fmt.Errorf("no blob recorded for storage id %q: %w", storageID, errdefs.ErrNotFound)
-	}
-	blobDigest, err := digest.Parse(blobDigestStr)
-	if err != nil {
-		return nil, fmt.Errorf("parsing blob digest for storage id %q: %w", storageID, err)
-	}
-	return s.openBlobAsFS(ctx, blobDigest)
 }
 
 // openLayerByDiffID finds the blob in the content store for diffID and returns it as an fs.FS.
@@ -551,18 +592,26 @@ func (s *Snapshotter) openLayerByDiffID(ctx context.Context, diffID digest.Diges
 	return s.openBlobAsFS(ctx, blobDigest)
 }
 
-// openBlobAsFS opens the blob at blobDigest from the content store and returns it as an fs.FS
-// backed by tarfs.  Gzip-compressed blobs are handled transparently.
+// readContentBlob reads the full content of a blob from the content store.
+func (s *Snapshotter) readContentBlob(ctx context.Context, d digest.Digest) ([]byte, error) {
+	ra, err := s.cs.ReaderAt(ctx, ocispec.Descriptor{Digest: d})
+	if err != nil {
+		return nil, err
+	}
+	defer ra.Close()
+	return io.ReadAll(io.NewSectionReader(ra, 0, ra.Size()))
+}
+
+// openBlobAsFS opens the blob at blobDigest from the content store and returns it as an fs.FS backed by tarfs.  Gzip-compressed blobs are handled transparently.
 func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest) (fs.FS, error) {
-	// blob data is immutable (content-addressed); detach from the snapshot RPC context
-	// so the ReaderAt outlives it, while preserving gRPC metadata (namespace etc.)
+	// blob data is immutable (content-addressed); detach from the snapshot RPC context so the ReaderAt outlives it, while preserving gRPC metadata (namespace etc.)
 	ra, size, err := s.openBlob(context.WithoutCancel(ctx), ocispec.Descriptor{Digest: blobDigest})
 	if err != nil {
 		return nil, fmt.Errorf("opening blob %s: %w", blobDigest, err)
 	}
 
-	// detect gzip by magic bytes
-	header := make([]byte, 2)
+	// detect compression by magic bytes
+	header := make([]byte, 4)
 	if _, err := ra.ReadAt(header, 0); err != nil {
 		ra.Close()
 		return nil, fmt.Errorf("reading blob header for %s: %w", blobDigest, err)
@@ -573,8 +622,9 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 	}
 	tarSize := size
 
-	if header[0] == 0x1f && header[1] == 0x8b {
-		// gzip-compressed blob
+	switch {
+	case header[0] == 0x1f && header[1] == 0x8b:
+		// gzip-compressed blob (application/vnd.oci.image.layer.v1.tar+gzip)
 		// gsip builds deflate checkpoints for seek-ahead but only at block
 		// boundaries (~32 KB each).  Tiny layers have zero or one block, giving
 		// zero checkpoints, so gsip.ReadAt fails for any non-zero offset.
@@ -605,7 +655,24 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 			tarRA = zr
 			tarSize = 1<<63 - 1 // uncompressed size unknown
 		}
-	} else {
+	case header[0] == 0x28 && header[1] == 0xB5 && header[2] == 0x2F && header[3] == 0xFD:
+		// zstd-compressed blob (application/vnd.oci.image.layer.v1.tar+zstd, produced by BuildKit).
+		// TODO there is no gsip-equivalent for zstd random access, so we always decompress into memory; very large zstd layers should ideally be written to a temp file instead.
+		zr, zstdErr := zstd.NewReader(io.NewSectionReader(ra, 0, size))
+		if zstdErr != nil {
+			ra.Close()
+			return nil, fmt.Errorf("creating zstd reader for %s: %w", blobDigest, zstdErr)
+		}
+		var buf bytes.Buffer
+		if _, zstdErr = io.Copy(&buf, zr); zstdErr != nil {
+			ra.Close()
+			return nil, fmt.Errorf("decompressing zstd blob for %s: %w", blobDigest, zstdErr)
+		}
+		zr.Close()
+		data := buf.Bytes()
+		tarRA = bytes.NewReader(data)
+		tarSize = int64(len(data))
+	default:
 		tarRA = ra
 	}
 
@@ -614,9 +681,7 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 		ra.Close()
 		return nil, fmt.Errorf("building tarfs for %s: %w", blobDigest, err)
 	}
-	// tarfs.New just completed the sequential scan, sending all checkpoint updates
-	// into the gsip drain goroutine's channel; yield so it can flush them into
-	// r.checkpoints before any FUSE read calls gsip.ReadAt
+	// tarfs.New just completed the sequential scan, sending all checkpoint updates into the gsip drain goroutine's channel; yield so it can flush them into r.checkpoints before any FUSE read calls gsip.ReadAt
 	if _, ok := tarRA.(*gsip.Reader); ok {
 		runtime.Gosched()
 	}
@@ -630,27 +695,6 @@ func (s *Snapshotter) openBlob(ctx context.Context, desc ocispec.Descriptor) (co
 		return nil, 0, err
 	}
 	return ra, ra.Size(), nil
-}
-
-// writeBlob records the compressed blob digest for storageID in a sidecar file.
-func (s *Snapshotter) writeBlob(storageID, blobDigest string) error {
-	return os.WriteFile(s.blobPath(storageID), []byte(blobDigest), 0o600)
-}
-
-// readBlob reads the blob digest sidecar for storageID.  Returns "" when no sidecar exists.
-func (s *Snapshotter) readBlob(storageID string) (string, error) {
-	data, err := os.ReadFile(s.blobPath(storageID))
-	if os.IsNotExist(err) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func (s *Snapshotter) blobPath(storageID string) string {
-	return filepath.Join(s.root, "meta", storageID+".blob")
 }
 
 // propagateNamespace extracts the containerd namespace from an incoming gRPC context and re-stamps it as an outgoing gRPC header so that downstream calls to the content-store proxy include the namespace correctly.

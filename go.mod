@@ -9,6 +9,7 @@ require (
 	github.com/cpuguy83/go2fuse v0.0.0-20260222182647-239b980c16a9
 	github.com/hanwen/go-fuse/v2 v2.10.1
 	github.com/jonjohnsonjr/targz v0.0.0-20260430225515-be2b5d38a861
+	github.com/klauspost/compress v1.18.6
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	google.golang.org/grpc v1.81.1
@@ -28,7 +29,6 @@ require (
 	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
-	go.etcd.io/bbolt v1.4.3 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect

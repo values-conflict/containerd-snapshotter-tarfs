@@ -114,15 +114,7 @@ Running in the dev container requires entering a user+mount namespace so that:
 
 The anchor for all processes is `unshare --user --map-root-user --mount`.  ALL processes that need to share FUSE mounts (containerd, the snapshotter, ctr) must run inside the SAME namespace -- each separate `unshare` call creates a different mount namespace and FUSE mounts do not propagate across them.
 
-**How to run:**
-```console
-$ (cd .tmp/containerd && make)  # build containerd and ctr if not already built
-$ unshare --user --map-root-user --mount -- bash
-(in namespace) $ .tmp/containerd/bin/containerd --config /tmp/containerd-base.toml &
-(in namespace) $ ./containerd-snapshotter-tarfs --containerd-socket ... &
-(in namespace) $ .tmp/containerd/bin/ctr images pull --snapshotter tarfs ...
-(in namespace) $ .tmp/containerd/bin/ctr images mount --snapshotter tarfs ...
-```
+**How to run locally:** build both binaries first (`go build -o /tmp/containerd-snapshotter-tarfs .` and `make` inside `.tmp/containerd`), write a minimal containerd config (version 3, `[grpc] address`, `[proxy_plugins.tarfs]` pointing at the tarfs socket, and `[[plugins."io.containerd.transfer.v1.local".unpack_config]]` with `snapshotter = "tarfs"`), then launch containerd + snapshotter + ctr all inside a single `unshare --user --map-root-user --mount -- bash -c '...'` invocation so they share the same mount namespace.
 
 **How to run tests:**
 ```console

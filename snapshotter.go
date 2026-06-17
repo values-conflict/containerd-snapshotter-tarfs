@@ -43,7 +43,7 @@ const (
 )
 
 // Snapshotter implements snapshots.Snapshotter by serving OCI image layers directly from the containerd content store via FUSE, without extraction.
-// All persistent state lives in the content store (blob labels) and the stateDir filesystem (FUSE mountpoints, overlay upper/work dirs).
+// All persistent state lives in the content store (blob labels).  stateDir holds only runtime state (FUSE mountpoints, overlay upper/work dirs) and is not preserved across restarts.
 // Snapshot kinds and parent chains are tracked in-memory; View/Active snapshots do not survive process restarts.
 type Snapshotter struct {
 	root string

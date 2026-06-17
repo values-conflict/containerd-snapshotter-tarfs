@@ -28,7 +28,7 @@ func main() {
 func run() error {
 	var (
 		socketPath       = flag.String("socket", "/run/containerd-snapshotter-tarfs/snapshotter.sock", "unix socket path for the snapshotter gRPC server")
-		stateDir         = flag.String("state-dir", "/var/lib/containerd-snapshotter-tarfs", "directory for snapshotter metadata and FUSE mount points")
+		stateDir         = flag.String("state-dir", "/run/containerd-snapshotter-tarfs", "directory for FUSE mount points and overlay upper/work dirs (runtime state; not preserved across restarts)")
 		containerdSocket = flag.String("containerd-socket", "/run/containerd/containerd.sock", "containerd gRPC socket (for content store access)")
 	)
 	flag.Parse()

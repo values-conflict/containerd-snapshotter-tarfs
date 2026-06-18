@@ -14,6 +14,8 @@ import (
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // memLabelStore is a simple in-memory label store for use in tests.  It satisfies local.LabelStore.
@@ -149,6 +151,216 @@ func labelContentBlob(t *testing.T, cs content.Store, d digest.Digest, labels ma
 	}
 	if _, err := cs.Update(ctx, info, fields...); err != nil {
 		t.Fatalf("Update(%s): %v", d, err)
+	}
+}
+
+// makeZstdLayer writes entries into a zstd-compressed tar and returns the compressed bytes and the uncompressed tar bytes
+func makeZstdLayer(t *testing.T, entries []struct{ name, body string }) ([]byte, []byte) {
+	t.Helper()
+	var plainBuf bytes.Buffer
+	if err := writeTarStream(&plainBuf, entries); err != nil {
+		t.Fatalf("writeTarStream: %v", err)
+	}
+	plainData := plainBuf.Bytes()
+	var compBuf bytes.Buffer
+	zw, err := zstd.NewWriter(&compBuf)
+	if err != nil {
+		t.Fatalf("zstd.NewWriter: %v", err)
+	}
+	if _, err := zw.Write(plainData); err != nil {
+		t.Fatalf("zstd write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zstd close: %v", err)
+	}
+	return compBuf.Bytes(), plainData
+}
+
+// noReadReader is a reader that fails the test if Read is ever called; used to assert fast paths skip decompression
+type noReadReader struct{ t *testing.T }
+
+func (r *noReadReader) Read(_ []byte) (int, error) {
+	r.t.Fatal("Read called: fast path should have returned before reaching decompression")
+	return 0, nil
+}
+
+// TestIngestDecompressedBlob_sha256DiffID verifies the normal path: known sha256 diffID, blob stored at that address, labels set correctly
+func TestIngestDecompressedBlob_sha256DiffID(t *testing.T) {
+	cs := newTestStore(t)
+	ctx := context.Background()
+
+	compData, plainData := makeZstdLayer(t, []struct{ name, body string }{{"hello", "world\n"}})
+	compDigest := digest.Canonical.FromBytes(compData)
+	diffID := digest.Canonical.FromBytes(plainData)
+
+	ingestBlob(t, cs, compData, compDigest, "application/vnd.oci.image.layer.v1.tar+zstd")
+	labelContentBlob(t, cs, compDigest, map[string]string{"containerd.io/uncompressed": diffID.String()})
+
+	sn := &Snapshotter{cs: cs}
+	zr, err := zstd.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		t.Fatalf("zstd.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	ra, size, err := sn.ingestDecompressedBlob(ctx, compDigest, zr)
+	if err != nil {
+		t.Fatalf("ingestDecompressedBlob: %v", err)
+	}
+	defer ra.Close()
+
+	got := make([]byte, size)
+	if _, err := ra.ReadAt(got, 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if !bytes.Equal(got, plainData) {
+		t.Errorf("decompressed content mismatch: got %d bytes, want %d", len(got), len(plainData))
+	}
+
+	info, err := cs.Info(ctx, compDigest)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if got := info.Labels["containerd.io/gc.ref.content.uncompressed"]; got != diffID.String() {
+		t.Errorf("gc.ref label = %q, want %q", got, diffID)
+	}
+	// containerd.io/uncompressed must not be overwritten
+	if got := info.Labels["containerd.io/uncompressed"]; got != diffID.String() {
+		t.Errorf("uncompressed label = %q, want %q", got, diffID)
+	}
+}
+
+// TestIngestDecompressedBlob_noDiffIDLabel verifies that ingestDecompressedBlob discovers the diffID via cw.Digest() and sets containerd.io/uncompressed when no label exists upfront
+func TestIngestDecompressedBlob_noDiffIDLabel(t *testing.T) {
+	cs := newTestStore(t)
+	ctx := context.Background()
+
+	compData, plainData := makeZstdLayer(t, []struct{ name, body string }{{"file", "content\n"}})
+	compDigest := digest.Canonical.FromBytes(compData)
+	wantDiffID := digest.Canonical.FromBytes(plainData)
+
+	// store compressed blob without any diffID label
+	ingestBlob(t, cs, compData, compDigest, "application/vnd.oci.image.layer.v1.tar+zstd")
+
+	sn := &Snapshotter{cs: cs}
+	zr, err := zstd.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		t.Fatalf("zstd.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	if _, _, err := sn.ingestDecompressedBlob(ctx, compDigest, zr); err != nil {
+		t.Fatalf("ingestDecompressedBlob: %v", err)
+	}
+
+	info, err := cs.Info(ctx, compDigest)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if got := info.Labels["containerd.io/uncompressed"]; got != wantDiffID.String() {
+		t.Errorf("uncompressed label = %q, want %q", got, wantDiffID)
+	}
+	if got := info.Labels["containerd.io/gc.ref.content.uncompressed"]; got != wantDiffID.String() {
+		t.Errorf("gc.ref label = %q, want %q", got, wantDiffID)
+	}
+}
+
+// TestIngestDecompressedBlob_fastPath verifies that a second call returns the cached blob without invoking the decompressor
+func TestIngestDecompressedBlob_fastPath(t *testing.T) {
+	cs := newTestStore(t)
+	ctx := context.Background()
+
+	compData, plainData := makeZstdLayer(t, []struct{ name, body string }{{"f", "v\n"}})
+	compDigest := digest.Canonical.FromBytes(compData)
+	diffID := digest.Canonical.FromBytes(plainData)
+
+	ingestBlob(t, cs, compData, compDigest, "application/vnd.oci.image.layer.v1.tar+zstd")
+	labelContentBlob(t, cs, compDigest, map[string]string{"containerd.io/uncompressed": diffID.String()})
+
+	sn := &Snapshotter{cs: cs}
+
+	// first call: populates cache and sets gc.ref label
+	zr, _ := zstd.NewReader(bytes.NewReader(compData))
+	ra1, size1, err := sn.ingestDecompressedBlob(ctx, compDigest, zr)
+	zr.Close()
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	ra1.Close()
+
+	// second call: must hit fast path via gc.ref label and never call Read on the decompressor
+	ra2, size2, err := sn.ingestDecompressedBlob(ctx, compDigest, &noReadReader{t})
+	if err != nil {
+		t.Fatalf("second call (fast path): %v", err)
+	}
+	defer ra2.Close()
+	if size1 != size2 {
+		t.Errorf("size mismatch: first=%d second=%d", size1, size2)
+	}
+}
+
+// TestIngestDecompressedBlob_sha512DiffID verifies that when containerd.io/uncompressed carries a sha512 diffID the writer is initialized with sha512 and the blob is stored at the sha512 address
+func TestIngestDecompressedBlob_sha512DiffID(t *testing.T) {
+	cs := newTestStore(t)
+	ctx := context.Background()
+
+	compData, plainData := makeZstdLayer(t, []struct{ name, body string }{{"hello", "world\n"}})
+	compDigest := digest.Canonical.FromBytes(compData)
+	sha512DiffID := digest.SHA512.FromBytes(plainData)
+
+	ingestBlob(t, cs, compData, compDigest, "application/vnd.oci.image.layer.v1.tar+zstd")
+	labelContentBlob(t, cs, compDigest, map[string]string{"containerd.io/uncompressed": sha512DiffID.String()})
+
+	sn := &Snapshotter{cs: cs}
+	zr, err := zstd.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		t.Fatalf("zstd.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	ra, size, err := sn.ingestDecompressedBlob(ctx, compDigest, zr)
+	if err != nil {
+		t.Fatalf("ingestDecompressedBlob: %v", err)
+	}
+	defer ra.Close()
+
+	got := make([]byte, size)
+	if _, err := ra.ReadAt(got, 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if !bytes.Equal(got, plainData) {
+		t.Errorf("decompressed content mismatch: got %d bytes, want %d", len(got), len(plainData))
+	}
+
+	// blob must be at the sha512 address
+	ucInfo, err := cs.Info(ctx, sha512DiffID)
+	if err != nil {
+		t.Fatalf("decompressed blob not found at sha512 diffID %s: %v", sha512DiffID, err)
+	}
+	if ucInfo.Size != int64(len(plainData)) {
+		t.Errorf("blob size at sha512 address = %d, want %d", ucInfo.Size, len(plainData))
+	}
+
+	info, err := cs.Info(ctx, compDigest)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if got := info.Labels["containerd.io/gc.ref.content.uncompressed"]; got != sha512DiffID.String() {
+		t.Errorf("gc.ref label = %q, want %q", got, sha512DiffID)
+	}
+	// containerd.io/uncompressed must remain sha512, not be overwritten with sha256
+	if got := info.Labels["containerd.io/uncompressed"]; got != sha512DiffID.String() {
+		t.Errorf("uncompressed label = %q, want %q", got, sha512DiffID)
+	}
+
+	// second call: fast path via gc.ref (sha512 address), no decompression
+	ra2, size2, err := sn.ingestDecompressedBlob(ctx, compDigest, &noReadReader{t})
+	if err != nil {
+		t.Fatalf("second call (fast path): %v", err)
+	}
+	defer ra2.Close()
+	if size2 != int64(len(plainData)) {
+		t.Errorf("fast path size = %d, want %d", size2, len(plainData))
 	}
 }
 

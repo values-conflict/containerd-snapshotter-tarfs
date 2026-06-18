@@ -65,6 +65,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fuse3 qemu-user-static
 
       - name: download containerd ${{ matrix.containerd }}
+        id: c8d
         env:
           CONTAINERD_VERSION: ${{ matrix.containerd }}
         run: |
@@ -114,6 +115,11 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl restart containerd
           sudo ctr version
+
+          case "$CONTAINERD_VERSION" in
+            1.* | 2.0.* | 2.1.* | 2.2.*) echo 'sha512=false' ;;
+            *) echo 'sha512=true' ;;
+          esac >> "$GITHUB_OUTPUT"
 
       - name: docker config
         run: |
@@ -214,6 +220,17 @@ jobs:
           echo "$output"
           [ "$output" = 'aarch64' ]
 
+      - run: sudo ctr images pull --snapshotter tarfs docker.io/tianon/test:sha512
+        if: steps.c8d.outputs.sha512 == 'true'
+      - name: mount tianon/test:sha512
+        if: steps.c8d.outputs.sha512 == 'true'
+        run: |
+          sudo mkdir --parents /mnt/sha512
+          sudo ctr images mount --snapshotter tarfs docker.io/tianon/test:sha512 /mnt/sha512
+          test -f /mnt/sha512/true
+          /mnt/sha512/true
+          sudo ctr images unmount /mnt/sha512
+
       - name: badtars
         run: |
           for tag in \
@@ -241,6 +258,8 @@ jobs:
           sudo ctr images unmount /mnt/true-final
 
       - run: docker pull docker.io/library/bash:latest
+      - run: docker pull docker.io/tianon/test:sha512
+        if: steps.c8d.outputs.sha512 == 'true'
 
       - name: docker run bash:latest (FUSE)
         run: docker run --rm docker.io/library/bash:latest grep containerd-snapshotter-tarfs /proc/mounts

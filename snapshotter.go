@@ -656,22 +656,35 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 			tarSize = 1<<63 - 1 // uncompressed size unknown
 		}
 	case header[0] == 0x28 && header[1] == 0xB5 && header[2] == 0x2F && header[3] == 0xFD:
-		// zstd-compressed blob (application/vnd.oci.image.layer.v1.tar+zstd, produced by BuildKit).
-		// TODO there is no gsip-equivalent for zstd random access, so we always decompress into memory; very large zstd layers should ideally be written to a temp file instead.
+		// zstd-compressed blob (application/vnd.oci.image.layer.v1.tar+zstd, produced by BuildKit); stream directly into the content store so the result is file-backed, falling back to bytes.Buffer only if the content store path fails
 		zr, zstdErr := zstd.NewReader(io.NewSectionReader(ra, 0, size))
 		if zstdErr != nil {
 			ra.Close()
 			return nil, fmt.Errorf("creating zstd reader for %s: %w", blobDigest, zstdErr)
 		}
-		var buf bytes.Buffer
-		if _, zstdErr = io.Copy(&buf, zr); zstdErr != nil {
-			ra.Close()
-			return nil, fmt.Errorf("decompressing zstd blob for %s: %w", blobDigest, zstdErr)
-		}
+		ucRA, ucSize, cacheErr := s.ingestDecompressedBlob(ctx, blobDigest, zr)
 		zr.Close()
-		data := buf.Bytes()
-		tarRA = bytes.NewReader(data)
-		tarSize = int64(len(data))
+		if cacheErr == nil {
+			ra.Close()
+			tarRA = ucRA
+			tarSize = ucSize
+		} else {
+			log.Printf("tarfs: zstd %s: content-store cache failed (%v); falling back to bytes.Buffer", blobDigest, cacheErr)
+			zr2, zstdErr2 := zstd.NewReader(io.NewSectionReader(ra, 0, size))
+			if zstdErr2 != nil {
+				ra.Close()
+				return nil, fmt.Errorf("creating zstd reader for %s: %w", blobDigest, zstdErr2)
+			}
+			var buf bytes.Buffer
+			if _, zstdErr2 = io.Copy(&buf, zr2); zstdErr2 != nil {
+				ra.Close()
+				return nil, fmt.Errorf("decompressing zstd blob for %s: %w", blobDigest, zstdErr2)
+			}
+			zr2.Close()
+			data := buf.Bytes()
+			tarRA = bytes.NewReader(data)
+			tarSize = int64(len(data))
+		}
 	default:
 		tarRA = ra
 	}
@@ -686,6 +699,81 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 		runtime.Gosched()
 	}
 	return fsys, nil
+}
+
+// ingestDecompressedBlob streams decompressed content directly into the content store; if containerd.io/uncompressed is already set on compressedDigest, its algorithm is passed to the writer via WithDescriptor so cw.Digest() uses the right algorithm and we commit at the correct address without a re-hash; sets containerd.io/gc.ref.content.uncompressed to anchor the cached blob under GC, and containerd.io/uncompressed if not already set
+func (s *Snapshotter) ingestDecompressedBlob(ctx context.Context, compressedDigest digest.Digest, decompressed io.Reader) (content.ReaderAt, int64, error) {
+	pctx := propagateNamespace(context.WithoutCancel(ctx))
+
+	// read the compressed blob's labels once; used for fast path and writer algorithm selection
+	info, _ := s.cs.Info(pctx, compressedDigest)
+
+	// fast path: gc.ref.content.uncompressed is our own cache marker; also check containerd.io/uncompressed which may reference a blob at a different algorithm address
+	for _, labelKey := range []string{"containerd.io/gc.ref.content.uncompressed", "containerd.io/uncompressed"} {
+		if dgstStr := info.Labels[labelKey]; dgstStr != "" {
+			if dgst, parseErr := digest.Parse(dgstStr); parseErr == nil {
+				if ucInfo, cacheErr := s.cs.Info(pctx, dgst); cacheErr == nil {
+					if ra, raErr := s.cs.ReaderAt(pctx, ocispec.Descriptor{Digest: dgst, Size: ucInfo.Size}); raErr == nil {
+						return ra, ucInfo.Size, nil
+					}
+				}
+			}
+		}
+	}
+
+	// if we know the expected diffID, pass it to the writer so it hashes with the right algorithm;
+	// cw.Digest() then returns the correct digest and we avoid a re-hash on Commit
+	writerOpts := []content.WriterOpt{content.WithRef("decompress-" + compressedDigest.String())}
+	knownDiffIDStr := info.Labels["containerd.io/uncompressed"]
+	if knownDiffIDStr != "" {
+		if d, parseErr := digest.Parse(knownDiffIDStr); parseErr == nil {
+			writerOpts = append(writerOpts, content.WithDescriptor(ocispec.Descriptor{Digest: d}))
+		}
+	}
+
+	cw, err := s.cs.Writer(pctx, writerOpts...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("opening content writer: %w", err)
+	}
+	defer cw.Close()
+
+	// truncate any partial data from an interrupted previous attempt
+	if status, statusErr := cw.Status(); statusErr == nil && status.Offset > 0 {
+		if truncErr := cw.Truncate(0); truncErr != nil {
+			return nil, 0, fmt.Errorf("resetting partial write for %s: %w", compressedDigest, truncErr)
+		}
+	}
+
+	n, err := io.Copy(cw, decompressed)
+	if err != nil {
+		return nil, 0, fmt.Errorf("streaming decompressed content for %s: %w", compressedDigest, err)
+	}
+
+	cachedDgst := cw.Digest()
+	if err := cw.Commit(pctx, n, cachedDgst); err != nil && !errdefs.IsAlreadyExists(err) {
+		return nil, 0, fmt.Errorf("committing decompressed blob %s: %w", cachedDgst, err)
+	}
+
+	// always set gc.ref to anchor the cached blob under GC; only set containerd.io/uncompressed if
+	// it was not already present (to avoid clobbering an existing diffID of a different algorithm)
+	newLabels := map[string]string{"containerd.io/gc.ref.content.uncompressed": cachedDgst.String()}
+	fieldpaths := []string{"labels.containerd.io/gc.ref.content.uncompressed"}
+	if knownDiffIDStr == "" {
+		newLabels["containerd.io/uncompressed"] = cachedDgst.String()
+		fieldpaths = append(fieldpaths, "labels.containerd.io/uncompressed")
+	}
+	if _, updateErr := s.cs.Update(pctx, content.Info{
+		Digest: compressedDigest,
+		Labels: newLabels,
+	}, fieldpaths...); updateErr != nil {
+		log.Printf("tarfs: labeling %s: %v (continuing)", compressedDigest, updateErr)
+	}
+
+	ra, err := s.cs.ReaderAt(pctx, ocispec.Descriptor{Digest: cachedDgst, Size: n})
+	if err != nil {
+		return nil, 0, fmt.Errorf("opening freshly ingested decompressed blob %s: %w", cachedDgst, err)
+	}
+	return ra, n, nil
 }
 
 // openBlob returns a ReaderAt and size for the blob described by desc.

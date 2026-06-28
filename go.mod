@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/containerd/containerd/api v1.11.1
-	github.com/containerd/containerd/v2 v2.3.1
+	github.com/containerd/containerd/v2 v2.3.2
 	github.com/containerd/errdefs v1.0.0
 	github.com/cpuguy83/go2fuse v0.0.0-20260222182647-239b980c16a9
 	github.com/hanwen/go-fuse/v2 v2.10.1

@@ -55,7 +55,7 @@ jobs:
           - 2.0.9
           - 2.1.8
           - 2.2.4
-          - 2.3.1
+          - 2.3.2
       fail-fast: false
     steps:
       - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
@@ -89,8 +89,8 @@ jobs:
             2.1.8-arm64)  sha256='c7c3d64fafbaccb4fb0143c82402db7d6c781e776d818a60fa0df94807814149' ;;
             2.2.4-amd64)  sha256='62e77f6294e432dca5b56ad7e7d6085b5bbb526ebba0a51d832714f9b04cfdfd' ;;
             2.2.4-arm64)  sha256='d0897c8e27c96a7b7d4c73e9b278ea9f559dda619d497d88b323a528bd1412c3' ;;
-            2.3.1-amd64)  sha256='628448bd973610c656c1cbea8e88b32fafd85b23cc1aa4a3372eb7198478c054' ;;
-            2.3.1-arm64)  sha256='46a83603a850f3916ca7c942310daaf82ed17773a85b1d431e92d4a541e46d0d' ;;
+            2.3.2-amd64)  sha256='75625e6f6595bb95f3fb9c8123a60534af4a8d9b52d7617065967bcefe71a17a' ;;
+            2.3.2-arm64)  sha256='6874adea935300402b7782d63bf58f1bd59a3323d76a9f22f27686001fb8997a' ;;
             *) echo >&2 "error: no checksum for containerd ${CONTAINERD_VERSION} ${arch}"; exit 1 ;;
           esac
           sha256sum --check --strict <<<"${sha256}  ${tarball}"

@@ -1,50 +1,10 @@
 package main
 
 import (
-	"archive/tar"
-	"bytes"
 	"fmt"
 	"io/fs"
 	"testing"
-
-	"github.com/jonjohnsonjr/targz/tarfs"
 )
-
-// makeLayerB builds a *tarfs.FS from name/body pairs.  It is the [testing.B] counterpart of makeTar in layers_test.go.
-func makeLayerB(b *testing.B, entries []struct{ name, body string }) *tarfs.FS {
-	b.Helper()
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	for _, e := range entries {
-		hdr := &tar.Header{
-			Name: e.name,
-			Mode: 0o644,
-			Size: int64(len(e.body)),
-		}
-		if len(e.name) > 0 && e.name[len(e.name)-1] == '/' {
-			hdr.Typeflag = tar.TypeDir
-			hdr.Size = 0
-			hdr.Mode = 0o755
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			b.Fatalf("WriteHeader %q: %v", e.name, err)
-		}
-		if e.body != "" {
-			if _, err := tw.Write([]byte(e.body)); err != nil {
-				b.Fatalf("Write %q: %v", e.name, err)
-			}
-		}
-	}
-	if err := tw.Close(); err != nil {
-		b.Fatalf("tar close: %v", err)
-	}
-	data := buf.Bytes()
-	fsys, err := tarfs.New(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		b.Fatalf("tarfs.New: %v", err)
-	}
-	return fsys
-}
 
 // buildReadFileStack builds a []fs.FS of the given depth for use in ReadFile benchmarks.
 // layers[0] (topmost) contains "etc/hostname" and layers[depth-1] (base) contains "etc/os-release";
@@ -54,7 +14,7 @@ func buildReadFileStack(b *testing.B, depth int, fileBody string) []fs.FS {
 	layers := make([]fs.FS, depth)
 
 	if depth == 1 {
-		layers[0] = makeLayerB(b, []struct{ name, body string }{
+		layers[0] = makeTar(b, []struct{ name, body string }{
 			{"etc/", ""},
 			{"etc/hostname", fileBody},
 			{"etc/os-release", fileBody},
@@ -62,13 +22,13 @@ func buildReadFileStack(b *testing.B, depth int, fileBody string) []fs.FS {
 		return layers
 	}
 
-	layers[0] = makeLayerB(b, []struct{ name, body string }{
+	layers[0] = makeTar(b, []struct{ name, body string }{
 		{"etc/", ""},
 		{"etc/hostname", fileBody},
 	})
 
 	for i := 1; i < depth-1; i++ {
-		layers[i] = makeLayerB(b, []struct{ name, body string }{
+		layers[i] = makeTar(b, []struct{ name, body string }{
 			{"etc/", ""},
 			{fmt.Sprintf("usr/lib/l%d/", i), ""},
 			{fmt.Sprintf("usr/lib/l%d/data", i), fmt.Sprintf("l%d\n", i)},
@@ -84,7 +44,7 @@ func buildReadFileStack(b *testing.B, depth int, fileBody string) []fs.FS {
 			fmt.Sprintf("lib/lib%02d.so", i), "elf placeholder\n",
 		})
 	}
-	layers[depth-1] = makeLayerB(b, base)
+	layers[depth-1] = makeTar(b, base)
 
 	return layers
 }
@@ -105,13 +65,13 @@ func buildReadDirStack(b *testing.B, depth, whiteoutsPerLayer int) *LayeredFS {
 			fmt.Sprintf("etc/file%02d", i), fmt.Sprintf("content%d\n", i),
 		})
 	}
-	layers[depth-1] = makeLayerB(b, base)
+	layers[depth-1] = makeTar(b, base)
 
 	if depth == 1 {
 		return &LayeredFS{layers: layers}
 	}
 
-	layers[0] = makeLayerB(b, []struct{ name, body string }{
+	layers[0] = makeTar(b, []struct{ name, body string }{
 		{"etc/", ""},
 		{"etc/app.conf", "app=prod\n"},
 	})
@@ -128,7 +88,7 @@ func buildReadDirStack(b *testing.B, depth, whiteoutsPerLayer int) *LayeredFS {
 				fmt.Sprintf("etc/l%d-%d", i, j), fmt.Sprintf("l%d-%d\n", i, j),
 			})
 		}
-		layers[i] = makeLayerB(b, entries)
+		layers[i] = makeTar(b, entries)
 	}
 
 	return &LayeredFS{layers: layers}

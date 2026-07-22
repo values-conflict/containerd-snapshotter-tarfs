@@ -105,11 +105,11 @@ func writeTarStream(w io.Writer, entries []struct{ name, body string }) error {
 }
 
 // makePlainLayer builds a plain (uncompressed) tar blob for use in tests.  For uncompressed tars, diffID == the blob digest -- no gsip needed.
-func makePlainLayer(t *testing.T, entries []struct{ name, body string }) ([]byte, digest.Digest) {
-	t.Helper()
+func makePlainLayer(tb testing.TB, entries []struct{ name, body string }) ([]byte, digest.Digest) {
+	tb.Helper()
 	var buf bytes.Buffer
 	if err := writeTarStream(&buf, entries); err != nil {
-		t.Fatalf("writeTarStream: %v", err)
+		tb.Fatalf("writeTarStream: %v", err)
 	}
 	data := buf.Bytes()
 	return data, digest.Canonical.FromBytes(data)
@@ -155,23 +155,23 @@ func labelContentBlob(tb testing.TB, cs content.Store, d digest.Digest, labels m
 }
 
 // makeZstdLayer writes entries into a zstd-compressed tar and returns the compressed bytes and the uncompressed tar bytes
-func makeZstdLayer(t *testing.T, entries []struct{ name, body string }) ([]byte, []byte) {
-	t.Helper()
+func makeZstdLayer(tb testing.TB, entries []struct{ name, body string }) ([]byte, []byte) {
+	tb.Helper()
 	var plainBuf bytes.Buffer
 	if err := writeTarStream(&plainBuf, entries); err != nil {
-		t.Fatalf("writeTarStream: %v", err)
+		tb.Fatalf("writeTarStream: %v", err)
 	}
 	plainData := plainBuf.Bytes()
 	var compBuf bytes.Buffer
 	zw, err := zstd.NewWriter(&compBuf)
 	if err != nil {
-		t.Fatalf("zstd.NewWriter: %v", err)
+		tb.Fatalf("zstd.NewWriter: %v", err)
 	}
 	if _, err := zw.Write(plainData); err != nil {
-		t.Fatalf("zstd write: %v", err)
+		tb.Fatalf("zstd write: %v", err)
 	}
 	if err := zw.Close(); err != nil {
-		t.Fatalf("zstd close: %v", err)
+		tb.Fatalf("zstd close: %v", err)
 	}
 	return compBuf.Bytes(), plainData
 }

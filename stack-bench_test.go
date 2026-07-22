@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -30,15 +29,10 @@ func buildStackFixture(b *testing.B, depth int, labeled bool) stackFixture {
 	layerSizes := make([]int, depth)
 
 	for i := range depth {
-		var buf bytes.Buffer
-		if err := writeTarStream(&buf, []struct{ name, body string }{
+		data, d := makePlainLayer(b, []struct{ name, body string }{
 			{fmt.Sprintf("l%d/", i), ""},
 			{fmt.Sprintf("l%d/f", i), fmt.Sprintf("%d\n", i)},
-		}); err != nil {
-			b.Fatalf("writeTarStream: %v", err)
-		}
-		data := buf.Bytes()
-		d := digest.Canonical.FromBytes(data)
+		})
 		ingestBlob(b, cs, data, d, ocispec.MediaTypeImageLayer)
 		diffIDs[i] = d
 		layerDigests[i] = d

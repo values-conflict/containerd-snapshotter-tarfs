@@ -38,10 +38,10 @@ jobs:
           printf '```\n' >> "$GITHUB_STEP_SUMMARY"
 
       - name: bench.txt
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bench-${{ github.sha }}
           path: bench.txt
+          archive: false
           overwrite: true
 
   # TODO e2e (name: E2E)

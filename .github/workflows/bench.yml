@@ -18,6 +18,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
 
@@ -33,9 +34,6 @@ jobs:
       - name: go test -bench
         run: |
           go test -bench=. -benchmem -count=6 -run='^$' ./... | tee "bench-$GITHUB_SHA.txt"
-          printf '```\n' >> "$GITHUB_STEP_SUMMARY"
-          cat "bench-$GITHUB_SHA.txt" >> "$GITHUB_STEP_SUMMARY"
-          printf '```\n' >> "$GITHUB_STEP_SUMMARY"
 
       - name: bench-${{ github.sha }}.txt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -43,5 +41,30 @@ jobs:
           path: bench-${{ github.sha }}.txt
           archive: false
           overwrite: true
+
+      - name: benchstat
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # find the run that produced the baseline artifact; gracefully absent on the first PR against a branch
+          artifact="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=bench-$BASE_SHA.txt&per_page=1" \
+              --jq '.artifacts[0]'
+          )"
+          artifactUrl="$(jq <<<"$artifact" --raw-output '.archive_download_url')"
+          if [ -z "$artifactUrl" ]; then
+            printf 'no baseline artifact for base %s -- run Benchmark on the base branch first\n' "$BASE_SHA" | tee -a "$GITHUB_STEP_SUMMARY" >&2
+            exit 1
+          fi
+          if ! gh api "$artifactUrl" > "baseline-bench-$BASE_SHA.txt"; then
+            printf 'baseline artifact unavailable (expired?)\n' | tee -a "$GITHUB_STEP_SUMMARY" >&2
+            exit 1
+          fi
+          printf '## benchstat (vs %s)\n\n```\n' "$BASE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          # https://pkg.go.dev/golang.org/x/perf/cmd/benchstat?tab=versions
+          go run golang.org/x/perf/cmd/benchstat@v0.0.0-20260709024250-82a0b07e230d "baseline-bench-$BASE_SHA.txt" "bench-$GITHUB_SHA.txt" >> "$GITHUB_STEP_SUMMARY"
+          printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+        if: github.event_name == 'pull_request'
 
   # TODO e2e (name: E2E)

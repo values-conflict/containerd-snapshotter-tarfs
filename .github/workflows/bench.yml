@@ -32,15 +32,15 @@ jobs:
 
       - name: go test -bench
         run: |
-          go test -bench=. -benchmem -count=6 -run='^$' ./... | tee bench.txt
+          go test -bench=. -benchmem -count=6 -run='^$' ./... | tee "bench-$GITHUB_SHA.txt"
           printf '```\n' >> "$GITHUB_STEP_SUMMARY"
-          cat bench.txt >> "$GITHUB_STEP_SUMMARY"
+          cat "bench-$GITHUB_SHA.txt" >> "$GITHUB_STEP_SUMMARY"
           printf '```\n' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: bench.txt
+      - name: bench-${{ github.sha }}.txt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: bench.txt
+          path: bench-${{ github.sha }}.txt
           archive: false
           overwrite: true
 

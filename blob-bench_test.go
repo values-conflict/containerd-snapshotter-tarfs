@@ -14,6 +14,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/jonjohnsonjr/targz/tarfs"
+	"github.com/klauspost/compress/zstd"
 )
 
 // makeGzipBlobB builds a gzip-compressed tar whose uncompressed size is approximately targetBytes.
@@ -43,6 +44,40 @@ func makeGzipBlobB(b *testing.B, targetBytes int) (compData, plainData []byte) {
 	}
 	if err := gw.Close(); err != nil {
 		b.Fatalf("gzip close: %v", err)
+	}
+	return compBuf.Bytes(), plainData
+}
+
+// makeZstdBlobB builds a zstd-compressed tar whose uncompressed size is approximately targetBytes.
+// The content is moderately compressible (10-char repeating pattern).
+func makeZstdBlobB(b *testing.B, targetBytes int) (compData, plainData []byte) {
+	b.Helper()
+	var plainBuf bytes.Buffer
+	tw := tar.NewWriter(&plainBuf)
+	body := strings.Repeat("abcdefghij", 100) // 1 KiB per entry, compresses ~5x
+	for plainBuf.Len() < targetBytes {
+		hdr := &tar.Header{Name: fmt.Sprintf("f%d", plainBuf.Len()), Mode: 0o644, Size: int64(len(body))}
+		if err := tw.WriteHeader(hdr); err != nil {
+			b.Fatalf("WriteHeader: %v", err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			b.Fatalf("Write: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		b.Fatalf("tar close: %v", err)
+	}
+	plainData = plainBuf.Bytes()
+	var compBuf bytes.Buffer
+	zw, err := zstd.NewWriter(&compBuf)
+	if err != nil {
+		b.Fatalf("zstd.NewWriter: %v", err)
+	}
+	if _, err := zw.Write(plainData); err != nil {
+		b.Fatalf("zstd write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		b.Fatalf("zstd close: %v", err)
 	}
 	return compBuf.Bytes(), plainData
 }
@@ -103,6 +138,77 @@ func BenchmarkOpenBlob_gzip(b *testing.B) {
 				b.Fatalf("pre-populate: %v", err)
 			}
 			gr.Close()
+
+			b.SetBytes(int64(len(plainData)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				// gc.ref label is set; ingestDecompressedBlob returns from the fast path without reading the reader
+				ra, size, err := sn.ingestDecompressedBlob(ctx, compDigest, bytes.NewReader(nil))
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := tarfs.New(ra, size); err != nil {
+					b.Fatal(err)
+				}
+				ra.Close()
+			}
+		})
+	}
+}
+
+// BenchmarkOpenBlob_zstd mirrors BenchmarkOpenBlob_gzip for zstd-compressed layers (BuildKit's default).
+// zstd decompresses faster than gzip, so the crossover point where the fastPath wins may differ.
+func BenchmarkOpenBlob_zstd(b *testing.B) {
+	sizes := []struct {
+		name  string
+		bytes int
+	}{
+		{"4KB", 4 << 10},
+		{"64KB", 64 << 10},
+		{"512KB", 512 << 10},
+		{"2MB", 2 << 20},
+		{"6MB", 6 << 20},
+	}
+
+	ctx := context.Background()
+
+	for _, sz := range sizes {
+		compData, plainData := makeZstdBlobB(b, sz.bytes)
+		compDigest := digest.Canonical.FromBytes(compData)
+		diffID := digest.Canonical.FromBytes(plainData)
+
+		b.Run("decompress/"+sz.name, func(b *testing.B) {
+			b.SetBytes(int64(len(plainData)))
+			b.ReportAllocs()
+			for b.Loop() {
+				zr, err := zstd.NewReader(bytes.NewReader(compData))
+				if err != nil {
+					b.Fatal(err)
+				}
+				var buf bytes.Buffer
+				if _, err := io.Copy(&buf, zr); err != nil {
+					b.Fatal(err)
+				}
+				zr.Close()
+				data := buf.Bytes()
+				if _, err := tarfs.New(bytes.NewReader(data), int64(len(data))); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run("fastPath/"+sz.name, func(b *testing.B) {
+			cs := newTestStore(b)
+			ingestBlob(b, cs, compData, compDigest, ocispec.MediaTypeImageLayerZstd)
+			labelContentBlob(b, cs, compDigest, map[string]string{"containerd.io/uncompressed": diffID.String()})
+			sn := &Snapshotter{cs: cs}
+			// first call: populates the cache
+			zr, _ := zstd.NewReader(bytes.NewReader(compData))
+			if _, _, err := sn.ingestDecompressedBlob(ctx, compDigest, zr); err != nil {
+				b.Fatalf("pre-populate: %v", err)
+			}
+			zr.Close()
 
 			b.SetBytes(int64(len(plainData)))
 			b.ReportAllocs()

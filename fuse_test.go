@@ -13,11 +13,11 @@ import (
 )
 
 // checkFUSE skips the test if FUSE mounting is not available in this environment (no fusermount/fusermount3, or insufficient privileges).
-func checkFUSE(t *testing.T) {
-	t.Helper()
+func checkFUSE(tb testing.TB) {
+	tb.Helper()
 	if _, err := exec.LookPath("fusermount3"); err != nil {
 		if _, err := exec.LookPath("fusermount"); err != nil {
-			t.Skip("FUSE not available: neither fusermount nor fusermount3 found (install fuse3 package)")
+			tb.Skip("FUSE not available: neither fusermount nor fusermount3 found (install fuse3 package)")
 		}
 	}
 }

@@ -1,0 +1,47 @@
+name: Benchmark
+
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: '23 10 * * 3'
+      timezone: 'America/Los_Angeles'
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: 'bash -Eeuo pipefail -x {0}'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+      - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+        with:
+          go-version-file: go.mod
+
+      - name: go test -bench
+        run: |
+          go test -bench=. -benchmem -count=6 -run='^$' ./... | tee bench.txt
+          printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          cat bench.txt >> "$GITHUB_STEP_SUMMARY"
+          printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: bench.txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench.txt
+          overwrite: true
+
+  # TODO e2e (name: E2E)

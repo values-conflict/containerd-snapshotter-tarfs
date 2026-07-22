@@ -69,11 +69,11 @@ func (m *memLabelStore) Update(d digest.Digest, updates map[string]string) (map[
 }
 
 // newTestStore creates a local content store backed by an in-memory label store.
-func newTestStore(t *testing.T) content.Store {
-	t.Helper()
-	cs, err := local.NewLabeledStore(t.TempDir(), newMemLabelStore())
+func newTestStore(tb testing.TB) content.Store {
+	tb.Helper()
+	cs, err := local.NewLabeledStore(tb.TempDir(), newMemLabelStore())
 	if err != nil {
-		t.Fatalf("NewLabeledStore: %v", err)
+		tb.Fatalf("NewLabeledStore: %v", err)
 	}
 	return cs
 }
@@ -105,41 +105,41 @@ func writeTarStream(w io.Writer, entries []struct{ name, body string }) error {
 }
 
 // makePlainLayer builds a plain (uncompressed) tar blob for use in tests.  For uncompressed tars, diffID == the blob digest -- no gsip needed.
-func makePlainLayer(t *testing.T, entries []struct{ name, body string }) ([]byte, digest.Digest) {
-	t.Helper()
+func makePlainLayer(tb testing.TB, entries []struct{ name, body string }) ([]byte, digest.Digest) {
+	tb.Helper()
 	var buf bytes.Buffer
 	if err := writeTarStream(&buf, entries); err != nil {
-		t.Fatalf("writeTarStream: %v", err)
+		tb.Fatalf("writeTarStream: %v", err)
 	}
 	data := buf.Bytes()
 	return data, digest.Canonical.FromBytes(data)
 }
 
 // ingestBlob writes data to a content.Store under the given digest.
-func ingestBlob(t *testing.T, cs content.Store, data []byte, d digest.Digest, mediaType string) {
-	t.Helper()
+func ingestBlob(tb testing.TB, cs content.Store, data []byte, d digest.Digest, mediaType string) {
+	tb.Helper()
 	ctx := context.Background()
 	desc := ocispec.Descriptor{Digest: d, Size: int64(len(data)), MediaType: mediaType}
 	w, err := cs.Writer(ctx, content.WithRef(d.String()), content.WithDescriptor(desc))
 	if err != nil {
-		t.Fatalf("Writer(%s): %v", d, err)
+		tb.Fatalf("Writer(%s): %v", d, err)
 	}
 	defer w.Close()
 	if _, err := w.Write(data); err != nil {
-		t.Fatalf("Write(%s): %v", d, err)
+		tb.Fatalf("Write(%s): %v", d, err)
 	}
 	if err := w.Commit(ctx, int64(len(data)), d); err != nil {
-		t.Fatalf("Commit(%s): %v", d, err)
+		tb.Fatalf("Commit(%s): %v", d, err)
 	}
 }
 
 // labelContentBlob sets labels on a blob in the content store.
-func labelContentBlob(t *testing.T, cs content.Store, d digest.Digest, labels map[string]string) {
-	t.Helper()
+func labelContentBlob(tb testing.TB, cs content.Store, d digest.Digest, labels map[string]string) {
+	tb.Helper()
 	ctx := context.Background()
 	info, err := cs.Info(ctx, d)
 	if err != nil {
-		t.Fatalf("Info(%s): %v", d, err)
+		tb.Fatalf("Info(%s): %v", d, err)
 	}
 	if info.Labels == nil {
 		info.Labels = map[string]string{}
@@ -150,28 +150,28 @@ func labelContentBlob(t *testing.T, cs content.Store, d digest.Digest, labels ma
 		fields = append(fields, "labels."+k)
 	}
 	if _, err := cs.Update(ctx, info, fields...); err != nil {
-		t.Fatalf("Update(%s): %v", d, err)
+		tb.Fatalf("Update(%s): %v", d, err)
 	}
 }
 
 // makeZstdLayer writes entries into a zstd-compressed tar and returns the compressed bytes and the uncompressed tar bytes
-func makeZstdLayer(t *testing.T, entries []struct{ name, body string }) ([]byte, []byte) {
-	t.Helper()
+func makeZstdLayer(tb testing.TB, entries []struct{ name, body string }) ([]byte, []byte) {
+	tb.Helper()
 	var plainBuf bytes.Buffer
 	if err := writeTarStream(&plainBuf, entries); err != nil {
-		t.Fatalf("writeTarStream: %v", err)
+		tb.Fatalf("writeTarStream: %v", err)
 	}
 	plainData := plainBuf.Bytes()
 	var compBuf bytes.Buffer
 	zw, err := zstd.NewWriter(&compBuf)
 	if err != nil {
-		t.Fatalf("zstd.NewWriter: %v", err)
+		tb.Fatalf("zstd.NewWriter: %v", err)
 	}
 	if _, err := zw.Write(plainData); err != nil {
-		t.Fatalf("zstd write: %v", err)
+		tb.Fatalf("zstd write: %v", err)
 	}
 	if err := zw.Close(); err != nil {
-		t.Fatalf("zstd close: %v", err)
+		tb.Fatalf("zstd close: %v", err)
 	}
 	return compBuf.Bytes(), plainData
 }

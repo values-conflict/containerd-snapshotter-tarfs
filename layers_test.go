@@ -10,8 +10,8 @@ import (
 )
 
 // makeTar builds a tar blob from a slice of (name, content) pairs.  names starting with "/" are stripped; directories end with "/".
-func makeTar(t *testing.T, entries []struct{ name, body string }) *tarfs.FS {
-	t.Helper()
+func makeTar(tb testing.TB, entries []struct{ name, body string }) *tarfs.FS {
+	tb.Helper()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	for _, e := range entries {
@@ -26,21 +26,21 @@ func makeTar(t *testing.T, entries []struct{ name, body string }) *tarfs.FS {
 			hdr.Mode = 0o755
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
-			t.Fatalf("WriteHeader %q: %v", e.name, err)
+			tb.Fatalf("WriteHeader %q: %v", e.name, err)
 		}
 		if e.body != "" {
 			if _, err := tw.Write([]byte(e.body)); err != nil {
-				t.Fatalf("Write %q: %v", e.name, err)
+				tb.Fatalf("Write %q: %v", e.name, err)
 			}
 		}
 	}
 	if err := tw.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+		tb.Fatalf("Close: %v", err)
 	}
 	data := buf.Bytes()
 	fsys, err := tarfs.New(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		t.Fatalf("tarfs.New: %v", err)
+		tb.Fatalf("tarfs.New: %v", err)
 	}
 	return fsys
 }

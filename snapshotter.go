@@ -335,16 +335,9 @@ func (s *Snapshotter) buildLayerStack(ctx context.Context, topChainID string) ([
 	if err := s.cs.Walk(ctx, tryManifest, `labels."containerd.io/gc.ref.content.config"`); err != nil {
 		return nil, fmt.Errorf("searching manifests for chainID %s: %w", topChainID, err)
 	}
-	if layers != nil {
-		log.Printf("tarfs: buildLayerStack %s: found via labeled manifest (%d layers)", topChainID, len(layers))
-	}
-
 	// second pass: all blobs (covers docker commit images whose manifest isn't labeled)
 	if layers == nil {
 		_ = s.cs.Walk(ctx, tryManifest)
-		if layers != nil {
-			log.Printf("tarfs: buildLayerStack %s: found via unlabeled manifest (%d layers)", topChainID, len(layers))
-		}
 	}
 
 	if layers == nil {
@@ -360,10 +353,8 @@ func (s *Snapshotter) buildLayerStack(ctx context.Context, topChainID string) ([
 		// third fallback: reconstruct from parentChains map (populated in Commit for docker commit/build layers).
 		// walks containerd.io/uncompressed blobs to find the new layer blob via the chainID formula.
 		if parentChainID, ok := s.parentChains.Load(topChainID); ok {
-			log.Printf("tarfs: buildLayerStack %s: trying parentChains fallback (parent %s)", topChainID, parentChainID.(string))
 			if parentFSLayers, err2 := s.buildLayerStack(ctx, parentChainID.(string)); err2 == nil {
 				if newBlob := s.findNewLayerBlob(ctx, parentChainID.(string), topChainID); newBlob != "" {
-					log.Printf("tarfs: buildLayerStack %s: found via parentChains+findNewLayerBlob", topChainID)
 					pctx2 := propagateNamespace(context.WithoutCancel(ctx))
 					_, _ = s.cs.Update(pctx2, content.Info{
 						Digest: newBlob,
@@ -382,11 +373,9 @@ func (s *Snapshotter) buildLayerStack(ctx context.Context, topChainID string) ([
 	}
 
 	// open each layer blob and cache its chainID label for future fast lookup
-	log.Printf("tarfs: buildLayerStack %s: opening %d layers", topChainID, len(layers))
 	pctx := propagateNamespace(context.WithoutCancel(ctx))
 	fsLayers := make([]fs.FS, len(layers))
 	for i, layer := range layers {
-		log.Printf("tarfs: buildLayerStack %s: layer[%d] chainID=%s blob=%s", topChainID, i, layer.chainID, layer.blobDigest)
 		if _, err := s.cs.Update(pctx, content.Info{
 			Digest: layer.blobDigest,
 			Labels: map[string]string{labelBlobChainID: layer.chainID},

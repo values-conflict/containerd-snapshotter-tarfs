@@ -67,4 +67,118 @@ jobs:
           printf '```\n' >> "$GITHUB_STEP_SUMMARY"
         if: github.event_name == 'pull_request'
 
-  # TODO e2e (name: E2E)
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+      - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+        with:
+          go-version-file: go.mod
+
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fuse3
+
+      - name: containerd 2.3.2
+        run: |
+          dpkgArch="$(dpkg --print-architecture)"
+          case "$dpkgArch" in
+            amd64) arch='amd64' ;;
+            arm64) arch='arm64' ;;
+            *) echo >&2 "error: unsupported architecture '$dpkgArch'"; exit 1 ;;
+          esac
+          tarball="containerd-2.3.2-linux-${arch}.tar.gz"
+          cd /tmp
+          curl -fsSL "https://github.com/containerd/containerd/releases/download/v2.3.2/${tarball}" -o "$tarball"
+          case "$dpkgArch" in
+            amd64) sha256='75625e6f6595bb95f3fb9c8123a60534af4a8d9b52d7617065967bcefe71a17a' ;;
+            arm64) sha256='6874adea935300402b7782d63bf58f1bd59a3323d76a9f22f27686001fb8997a' ;;
+          esac
+          sha256sum --check --strict <<<"${sha256}  ${tarball}"
+          sudo tar --extract --file "$tarball" --directory /usr/local/bin/ --strip-components=1
+          sudo mkdir --parents /etc/systemd/system/containerd.service.d
+          sudo tee /etc/systemd/system/containerd.service.d/execstart.conf << 'EOF'
+          [Service]
+          ExecStart=
+          ExecStart=/usr/local/bin/containerd
+          EOF
+          {
+            printf '%s\n' 'imports = ["/etc/containerd/conf.d/*.toml"]'
+            containerd config default | jq --raw-input --raw-output 'select(test("^imports") | not)'
+          } | sudo tee /etc/containerd/config.toml > /dev/null
+          sudo mkdir --parents /etc/containerd/conf.d
+          sudo systemctl daemon-reload
+          sudo systemctl restart containerd
+          sudo ctr version
+
+      - name: docker config
+        run: |
+          jq --null-input --tab '{ "features": { "containerd-snapshotter": true } }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker version
+
+      - run: go build -o containerd-snapshotter-tarfs .
+
+      - name: start snapshotter
+        run: |
+          sudo mkdir --parents /run/containerd-snapshotter-tarfs
+          sudo "$PWD/containerd-snapshotter-tarfs" > /tmp/snapshotter.log 2>&1 &
+          for i in $(seq 30); do
+            if [ -S /run/containerd-snapshotter-tarfs/snapshotter.sock ]; then
+              break
+            fi
+            sleep 1
+            [ "$i" -lt 30 ] || { echo >&2 'error: timed out waiting for snapshotter'; exit 1; }
+          done
+
+      - name: configure tarfs
+        run: |
+          sudo tee /etc/containerd/conf.d/tarfs.toml << 'EOF'
+          [proxy_plugins.tarfs]
+            type = "snapshot"
+            address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+          [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+            snapshotter = "tarfs"
+            platform = "linux"
+          EOF
+
+          jq --tab '."storage-driver" = "tarfs"' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+
+          sudo systemctl stop containerd docker
+          sudo rm --recursive --force /var/lib/containerd /var/lib/docker
+          sudo systemctl start containerd docker
+          docker version
+
+      - name: e2e tarfs
+        run: |
+          rm -f e2e-tests.json
+          jq --null-input --raw-output 'include "e2e-tests"; tests | shell' | bash -Eeuo pipefail -x
+          mv e2e-tests.json e2e-tests-tarfs.json
+
+      - name: switch to overlay
+        run: |
+          sudo pkill containerd-snapshotter-tarfs || :
+          sudo rm /etc/containerd/conf.d/tarfs.toml
+          jq --tab 'del(."storage-driver")' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          # wipe containerd's state entirely so overlay pulls from scratch -- content store blobs are
+          # aggressively GC'd after docker image rm anyway, so relying on blob reuse isn't reliable
+          sudo systemctl stop containerd docker
+          sudo rm --recursive --force /var/lib/containerd /var/lib/docker
+          sudo systemctl start containerd docker
+          docker version
+
+      - name: e2e overlay
+        run: |
+          rm -f e2e-tests.json
+          jq --null-input --raw-output 'include "e2e-tests"; tests | shell' | bash -Eeuo pipefail -x
+          mv e2e-tests.json e2e-tests-overlay.json
+
+      - name: summary
+        run: |
+          jq --slurp --raw-output 'include "e2e-tests"; { tarfs: .[0], overlay: .[1] } | summary' e2e-tests-{tarfs,overlay}.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: snapshotter log
+        run: sudo cat /tmp/snapshotter.log
+        if: failure()

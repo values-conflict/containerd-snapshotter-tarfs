@@ -55,7 +55,7 @@ def shell:
 					"\($dockerRun) > /dev/null # throwaway run to warm caches",
 
 					"total=0 count=10",
-					"for i in {1..$count}; do",
+					"for (( i = 0; i < count; i++ )); do",
 					"\tms=$(_time \($dockerRun) 3> /dev/null)",
 					"\t(( total += ms )) || :",
 					"done",

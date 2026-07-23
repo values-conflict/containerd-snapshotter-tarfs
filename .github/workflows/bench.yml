@@ -67,4 +67,311 @@ jobs:
           printf '```\n' >> "$GITHUB_STEP_SUMMARY"
         if: github.event_name == 'pull_request'
 
-  # TODO e2e (name: E2E)
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tianon/actions/checkout/composite@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+      - uses: tianon/actions/setup-go@f7414637108a155a422f9894dc1e0a9990892dfc # HEAD
+        with:
+          go-version-file: go.mod
+
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fuse3
+
+      - name: containerd 2.3.2
+        run: |
+          dpkgArch="$(dpkg --print-architecture)"
+          case "$dpkgArch" in
+            amd64) arch='amd64' ;;
+            arm64) arch='arm64' ;;
+            *) echo >&2 "error: unsupported architecture '$dpkgArch'"; exit 1 ;;
+          esac
+          tarball="containerd-2.3.2-linux-${arch}.tar.gz"
+          cd /tmp
+          curl -fsSL "https://github.com/containerd/containerd/releases/download/v2.3.2/${tarball}" -o "$tarball"
+          case "$dpkgArch" in
+            amd64) sha256='75625e6f6595bb95f3fb9c8123a60534af4a8d9b52d7617065967bcefe71a17a' ;;
+            arm64) sha256='6874adea935300402b7782d63bf58f1bd59a3323d76a9f22f27686001fb8997a' ;;
+          esac
+          sha256sum --check --strict <<<"${sha256}  ${tarball}"
+          sudo tar --extract --file "$tarball" --directory /usr/local/bin/ --strip-components=1
+          sudo mkdir --parents /etc/systemd/system/containerd.service.d
+          sudo tee /etc/systemd/system/containerd.service.d/execstart.conf << 'EOF'
+          [Service]
+          ExecStart=
+          ExecStart=/usr/local/bin/containerd
+          EOF
+          {
+            printf '%s\n' 'imports = ["/etc/containerd/conf.d/*.toml"]'
+            containerd config default | jq --raw-input --raw-output 'select(test("^imports") | not)'
+          } | sudo tee /etc/containerd/config.toml > /dev/null
+          sudo mkdir --parents /etc/containerd/conf.d
+          sudo systemctl daemon-reload
+          sudo systemctl restart containerd
+          sudo ctr version
+
+      - name: docker config
+        run: |
+          jq --null-input --tab '{ "features": { "containerd-snapshotter": true } }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker version
+
+      - run: go build -o containerd-snapshotter-tarfs .
+
+      - name: start snapshotter
+        run: |
+          sudo mkdir --parents /run/containerd-snapshotter-tarfs
+          sudo "$PWD/containerd-snapshotter-tarfs" > /tmp/snapshotter.log 2>&1 &
+          for i in $(seq 30); do
+            if [ -S /run/containerd-snapshotter-tarfs/snapshotter.sock ]; then
+              break
+            fi
+            sleep 1
+            [ "$i" -lt 30 ] || { echo >&2 'error: timed out waiting for snapshotter'; exit 1; }
+          done
+
+      - name: configure tarfs
+        run: |
+          sudo tee /etc/containerd/conf.d/tarfs.toml << 'EOF'
+          [proxy_plugins.tarfs]
+            type = "snapshot"
+            address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+          [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+            snapshotter = "tarfs"
+            platform = "linux"
+          EOF
+
+          jq --tab '."storage-driver" = "tarfs"' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+
+          sudo systemctl stop containerd docker
+          sudo rm --recursive --force /var/lib/containerd /var/lib/docker
+          sudo systemctl start containerd docker
+          docker version
+
+      - name: e2e tarfs
+        id: tarfs
+        run: |
+          start=$(date +%s%N)
+          docker pull bash:latest
+          end=$(date +%s%N)
+          pullMs=$(( (end - start) / 1000000 ))
+
+          # one throwaway run to let FUSE settle, then 10 timed runs
+          docker run --rm bash:latest echo hello > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm bash:latest echo hello > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          runMs=$(( total / 10 ))
+
+          # filesystem traversal: ReadDir + Stat on every file (busybox find/wc inside Alpine)
+          docker run --rm bash:latest sh -c 'find / -type f | wc -l' > /dev/null
+          total=0
+          for i in $(seq 5); do
+            start=$(date +%s%N)
+            docker run --rm bash:latest sh -c 'find / -type f | wc -l' > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          findMs=$(( total / 5 ))
+
+          # sequential read: open and read the bash binary through the filesystem
+          docker run --rm bash:latest wc -c /usr/local/bin/bash > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm bash:latest wc -c /usr/local/bin/bash > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          wcMs=$(( total / 10 ))
+
+          printf 'pullMs=%s\n' "$pullMs" >> "$GITHUB_OUTPUT"
+          printf 'runMs=%s\n' "$runMs" >> "$GITHUB_OUTPUT"
+          printf 'findMs=%s\n' "$findMs" >> "$GITHUB_OUTPUT"
+          printf 'wcMs=%s\n' "$wcMs" >> "$GITHUB_OUTPUT"
+
+          # golang:latest -- large Debian-based image with Go toolchain + stdlib
+          start=$(date +%s%N)
+          docker pull golang:latest
+          end=$(date +%s%N)
+          golangPullMs=$(( (end - start) / 1000000 ))
+
+          docker run --rm golang:latest echo hello > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm golang:latest echo hello > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          golangRunMs=$(( total / 10 ))
+
+          docker run --rm golang:latest sh -c 'find / -type f | wc -l' > /dev/null
+          total=0
+          for i in $(seq 5); do
+            start=$(date +%s%N)
+            docker run --rm golang:latest sh -c 'find / -type f | wc -l' > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          golangFindMs=$(( total / 5 ))
+
+          docker run --rm golang:latest wc -c /usr/local/go/bin/go > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm golang:latest wc -c /usr/local/go/bin/go > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          golangWcMs=$(( total / 10 ))
+
+          printf 'golangPullMs=%s\n' "$golangPullMs" >> "$GITHUB_OUTPUT"
+          printf 'golangRunMs=%s\n' "$golangRunMs" >> "$GITHUB_OUTPUT"
+          printf 'golangFindMs=%s\n' "$golangFindMs" >> "$GITHUB_OUTPUT"
+          printf 'golangWcMs=%s\n' "$golangWcMs" >> "$GITHUB_OUTPUT"
+
+      - name: switch to overlay
+        run: |
+          sudo pkill containerd-snapshotter-tarfs || :
+          sudo rm /etc/containerd/conf.d/tarfs.toml
+          jq --tab 'del(."storage-driver")' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          # wipe containerd's state entirely so overlay pulls from scratch -- content store blobs are
+          # aggressively GC'd after docker image rm anyway, so relying on blob reuse isn't reliable
+          sudo systemctl stop containerd docker
+          sudo rm --recursive --force /var/lib/containerd /var/lib/docker
+          sudo systemctl start containerd docker
+          docker version
+
+      - name: e2e overlay
+        id: overlay
+        run: |
+          start=$(date +%s%N)
+          docker pull bash:latest
+          end=$(date +%s%N)
+          pullMs=$(( (end - start) / 1000000 ))
+
+          docker run --rm bash:latest echo hello > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm bash:latest echo hello > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          runMs=$(( total / 10 ))
+
+          docker run --rm bash:latest sh -c 'find / -type f | wc -l' > /dev/null
+          total=0
+          for i in $(seq 5); do
+            start=$(date +%s%N)
+            docker run --rm bash:latest sh -c 'find / -type f | wc -l' > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          findMs=$(( total / 5 ))
+
+          docker run --rm bash:latest wc -c /usr/local/bin/bash > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm bash:latest wc -c /usr/local/bin/bash > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          wcMs=$(( total / 10 ))
+
+          printf 'pullMs=%s\n' "$pullMs" >> "$GITHUB_OUTPUT"
+          printf 'runMs=%s\n' "$runMs" >> "$GITHUB_OUTPUT"
+          printf 'findMs=%s\n' "$findMs" >> "$GITHUB_OUTPUT"
+          printf 'wcMs=%s\n' "$wcMs" >> "$GITHUB_OUTPUT"
+
+          start=$(date +%s%N)
+          docker pull golang:latest
+          end=$(date +%s%N)
+          golangPullMs=$(( (end - start) / 1000000 ))
+
+          docker run --rm golang:latest echo hello > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm golang:latest echo hello > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          golangRunMs=$(( total / 10 ))
+
+          docker run --rm golang:latest sh -c 'find / -type f | wc -l' > /dev/null
+          total=0
+          for i in $(seq 5); do
+            start=$(date +%s%N)
+            docker run --rm golang:latest sh -c 'find / -type f | wc -l' > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          golangFindMs=$(( total / 5 ))
+
+          docker run --rm golang:latest wc -c /usr/local/go/bin/go > /dev/null
+          total=0
+          for i in $(seq 10); do
+            start=$(date +%s%N)
+            docker run --rm golang:latest wc -c /usr/local/go/bin/go > /dev/null
+            end=$(date +%s%N)
+            total=$(( total + (end - start) / 1000000 ))
+          done
+          golangWcMs=$(( total / 10 ))
+
+          printf 'golangPullMs=%s\n' "$golangPullMs" >> "$GITHUB_OUTPUT"
+          printf 'golangRunMs=%s\n' "$golangRunMs" >> "$GITHUB_OUTPUT"
+          printf 'golangFindMs=%s\n' "$golangFindMs" >> "$GITHUB_OUTPUT"
+          printf 'golangWcMs=%s\n' "$golangWcMs" >> "$GITHUB_OUTPUT"
+
+      - name: summary
+        env:
+          TARFS_PULL: ${{ steps.tarfs.outputs.pullMs }}
+          TARFS_RUN: ${{ steps.tarfs.outputs.runMs }}
+          TARFS_FIND: ${{ steps.tarfs.outputs.findMs }}
+          TARFS_WC: ${{ steps.tarfs.outputs.wcMs }}
+          TARFS_GOLANG_PULL: ${{ steps.tarfs.outputs.golangPullMs }}
+          TARFS_GOLANG_RUN: ${{ steps.tarfs.outputs.golangRunMs }}
+          TARFS_GOLANG_FIND: ${{ steps.tarfs.outputs.golangFindMs }}
+          TARFS_GOLANG_WC: ${{ steps.tarfs.outputs.golangWcMs }}
+          OVERLAY_PULL: ${{ steps.overlay.outputs.pullMs }}
+          OVERLAY_RUN: ${{ steps.overlay.outputs.runMs }}
+          OVERLAY_FIND: ${{ steps.overlay.outputs.findMs }}
+          OVERLAY_WC: ${{ steps.overlay.outputs.wcMs }}
+          OVERLAY_GOLANG_PULL: ${{ steps.overlay.outputs.golangPullMs }}
+          OVERLAY_GOLANG_RUN: ${{ steps.overlay.outputs.golangRunMs }}
+          OVERLAY_GOLANG_FIND: ${{ steps.overlay.outputs.golangFindMs }}
+          OVERLAY_GOLANG_WC: ${{ steps.overlay.outputs.golangWcMs }}
+        run: |
+          printf '## e2e: tarfs vs overlay\n\n' >> "$GITHUB_STEP_SUMMARY"
+
+          printf '### bash:latest (Alpine, small)\n\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '| | tarfs | overlay |\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '|---|---:|---:|\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '| pull (ms) | %s | %s |\n' "$TARFS_PULL" "$OVERLAY_PULL" >> "$GITHUB_STEP_SUMMARY"
+          printf '| avg `echo hello` ×10 (ms) | %s | %s |\n' "$TARFS_RUN" "$OVERLAY_RUN" >> "$GITHUB_STEP_SUMMARY"
+          printf '| avg `find / -type f \| wc -l` ×5 (ms) | %s | %s |\n' "$TARFS_FIND" "$OVERLAY_FIND" >> "$GITHUB_STEP_SUMMARY"
+          printf '| avg `wc -c /usr/local/bin/bash` ×10 (ms) | %s | %s |\n' "$TARFS_WC" "$OVERLAY_WC" >> "$GITHUB_STEP_SUMMARY"
+
+          printf '\n### golang:latest (Debian, large)\n\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '| | tarfs | overlay |\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '|---|---:|---:|\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '| pull (ms) | %s | %s |\n' "$TARFS_GOLANG_PULL" "$OVERLAY_GOLANG_PULL" >> "$GITHUB_STEP_SUMMARY"
+          printf '| avg `echo hello` ×10 (ms) | %s | %s |\n' "$TARFS_GOLANG_RUN" "$OVERLAY_GOLANG_RUN" >> "$GITHUB_STEP_SUMMARY"
+          printf '| avg `find / -type f \| wc -l` ×5 (ms) | %s | %s |\n' "$TARFS_GOLANG_FIND" "$OVERLAY_GOLANG_FIND" >> "$GITHUB_STEP_SUMMARY"
+          printf '| avg `wc -c /usr/local/go/bin/go` ×10 (ms) | %s | %s |\n' "$TARFS_GOLANG_WC" "$OVERLAY_GOLANG_WC" >> "$GITHUB_STEP_SUMMARY"
+
+          printf '\n_both pulls download from scratch; the pull time delta approximates extraction cost_\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: snapshotter log
+        run: sudo cat /tmp/snapshotter.log
+        if: failure()

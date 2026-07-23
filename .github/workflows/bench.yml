@@ -61,10 +61,10 @@ jobs:
             printf 'baseline artifact unavailable (expired?)\n' | tee -a "$GITHUB_STEP_SUMMARY" >&2
             exit 1
           fi
-          printf '## benchstat (vs %s)\n\n```\n' "$BASE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf '<details>\n<summary>benchstat (vs %s)</summary>\n\n```\n' "$BASE_SHA" >> "$GITHUB_STEP_SUMMARY"
           # https://pkg.go.dev/golang.org/x/perf/cmd/benchstat?tab=versions
           go run golang.org/x/perf/cmd/benchstat@v0.0.0-20260709024250-82a0b07e230d "baseline-bench-$BASE_SHA.txt" "bench-$GITHUB_SHA.txt" >> "$GITHUB_STEP_SUMMARY"
-          printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '```\n\n</details>\n' >> "$GITHUB_STEP_SUMMARY"
         if: github.event_name == 'pull_request'
 
   e2e:

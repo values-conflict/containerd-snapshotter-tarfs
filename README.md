@@ -1,6 +1,57 @@
 # containerd-snapshotter-tarfs
 
-A FUSE-based containerd proxy snapshotter that mounts OCI image layers directly from the content store -- no extraction step, no duplicate disk usage.
+A FUSE-based containerd proxy snapshotter that mounts OCI image layers directly from the content store.
+
+## Caveat: extraction still happens at pull time
+
+Despite the goal of skipping extraction entirely, tarfs currently _does_ extract each layer tarball during `docker pull` -- just to a temporary directory that's immediately deleted.
+
+The culprit is a coupling baked into containerd's unpack pipeline.  The transfer service fetches manifests and configs, but layer blobs are downloaded by the per-layer unpacker goroutine, which also applies the layer to the snapshot.  The proxy snapshotter API has no signal for "fetch the blob but skip the apply": returning `snapshots.ErrAlreadyExists` from `Prepare` skips both the apply _and_ the fetch, so the blob never lands in the content store and tarfs has nothing to serve from.
+
+The current workaround is to return empty mounts from `Prepare` for extraction-keyed snapshots.  containerd then extracts into a temporary directory under `/var/lib/containerd/tmpmounts/`, computes the diffID from the decompressed stream, and -- with a patched containerd (see next section) -- deletes the temporary directory when done.  The compressed blob stays in the content store; the FUSE mount serves all subsequent reads from it.
+
+Practical impact:
+
+- **At rest:** only compressed blobs on disk, no extracted copies -- the disk-space goal is met
+- **During pull:** the full uncompressed layer is temporarily written to and immediately deleted from disk; for a golang-sized image (~300 MiB compressed, ~800 MiB uncompressed) this means pull I/O is roughly 2.7x a bare download
+- **Container start:** reads come from the FUSE mount backed by the compressed blob, as intended
+
+The real fix requires decoupling fetch from extraction inside containerd.  A custom differ plugin registered within the containerd process could fetch without extracting, but proxy snapshotters can't reach the containerd plugin registry.  No upstream API for "fetch-only" applies exists today.  Until one does, every image pull discards roughly 2-3x the image's compressed size in temporary disk I/O.
+
+## Caveat: the temp dir cleanup requires a patched containerd
+
+This doesn't fix the fundamental problem -- extraction still happens in full; it just ensures the extracted content is actually deleted afterward rather than accumulating on disk forever.
+
+Stock containerd's [`WithTempMount`](https://github.com/containerd/containerd/blob/v2.3.2/core/mount/temp.go#L42-L53) cleans up the temp directory with `os.Remove`, which returns `ENOTEMPTY` on a non-empty directory and does nothing further -- the error is logged and swallowed.  Since the extraction callback wrote the full uncompressed layer into the directory before cleanup ran, `os.Remove` always fails, and the extracted content accumulates indefinitely under `/var/lib/containerd/tmpmounts/`.  Without the patch, every `docker pull` permanently leaves the full uncompressed layer on disk rather than just transiently.
+
+The fix:
+
+```diff
+--- a/core/mount/temp.go
++++ b/core/mount/temp.go
+@@ -45,9 +45,18 @@ func WithTempMount(ctx context.Context, mounts []Mount, f func(root string) erro
+ 	// the mounted dir. However, if we use Remove, even though we won't
+ 	// successfully delete the temp dir and it may leak, we won't loss data
+ 	// from the mounted dir.
+ 	// For details, please refer to #1868 #1785.
++	//
++	// When no mounts were attempted, nothing is mounted under root, so
++	// RemoveAll is safe as a fallback if Remove fails (e.g. when the callback
++	// wrote files directly into root with no prior mount syscall).
+ 	defer func() {
+ 		if uerr = os.Remove(root); uerr != nil {
+-			log.G(ctx).WithError(uerr).WithField("dir", root).Error("failed to remove mount temp dir")
++			if len(mounts) == 0 {
++				uerr = os.RemoveAll(root)
++			}
++			if uerr != nil {
++				log.G(ctx).WithError(uerr).WithField("dir", root).Error("failed to remove mount temp dir")
++			}
+ 		}
+ 	}()
+```
+
+When `len(mounts) == 0`, no mount syscall was made, so nothing is live in the directory and `os.RemoveAll` is safe.  This should be submitted upstream; until it lands in a released containerd, you'll need to build from source.
 
 ## Why?
 

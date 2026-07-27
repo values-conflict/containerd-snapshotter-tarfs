@@ -163,27 +163,39 @@ jobs:
         run: |
           sudo tee /etc/containerd/conf.d/tarfs.toml << 'EOF'
           [proxy_plugins.tarfs]
-            type = "snapshot"
+            type    = "snapshot"
             address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
 
-          [[plugins."io.containerd.transfer.v1.local".unpack_config]]
-            snapshotter = "tarfs"
-            platform = "linux"
+          [proxy_plugins.tardiffs]
+            type    = "diff"
+            address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+          [plugins."io.containerd.service.v1.diff-service"]
+            default = ["tardiffs", "walking"]
           EOF
           case "$CONTAINERD_VERSION" in
             2.0.*)
-              # containerd v2.0.x predates check_platform_supported, breaking cross-arch pulls with a custom snapshotter unless we are more specific in the config
-              sudo head -3 /etc/containerd/conf.d/tarfs.toml | sudo tee /etc/containerd/conf.d/tarfs.toml.new
-              sudo mv /etc/containerd/conf.d/tarfs.toml.new /etc/containerd/conf.d/tarfs.toml
-              sudo tee /etc/containerd/conf.d/tarfs-c8d-2.0.toml <<'EOF'
+              # containerd v2.0.x predates check_platform_supported; always uses platforms.Only (exact
+              # OS+arch) rather than platforms.OnlyOS, so "linux" resolves as linux/<host-arch> and
+              # cross-arch pulls fail -- explicit per-arch entries required
+              sudo tee /etc/containerd/conf.d/tarfs-unpack.toml << 'EOF'
           [[plugins."io.containerd.transfer.v1.local".unpack_config]]
             snapshotter = "tarfs"
-            platform = "linux/amd64"
+            differ      = "tardiffs"
+            platform    = "linux/amd64"
 
           [[plugins."io.containerd.transfer.v1.local".unpack_config]]
             snapshotter = "tarfs"
-            platform = "linux/arm64"
-            differ = "walking"
+            differ      = "tardiffs"
+            platform    = "linux/arm64"
+          EOF
+              ;;
+            *)
+              sudo tee /etc/containerd/conf.d/tarfs-unpack.toml << 'EOF'
+          [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+            snapshotter = "tarfs"
+            differ      = "tardiffs"
+            platform    = "linux"
           EOF
               ;;
           esac

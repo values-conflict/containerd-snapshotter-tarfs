@@ -1,57 +1,6 @@
 # containerd-snapshotter-tarfs
 
-A FUSE-based containerd proxy snapshotter that mounts OCI image layers directly from the content store.
-
-## Caveat: extraction still happens at pull time
-
-Despite the goal of skipping extraction entirely, tarfs currently _does_ extract each layer tarball during `docker pull` -- just to a temporary directory that's immediately deleted.
-
-The culprit is a coupling baked into containerd's unpack pipeline.  The transfer service fetches manifests and configs, but layer blobs are downloaded by the per-layer unpacker goroutine, which also applies the layer to the snapshot.  The proxy snapshotter API has no signal for "fetch the blob but skip the apply": returning `snapshots.ErrAlreadyExists` from `Prepare` skips both the apply _and_ the fetch, so the blob never lands in the content store and tarfs has nothing to serve from.
-
-The current workaround is to return empty mounts from `Prepare` for extraction-keyed snapshots.  containerd then extracts into a temporary directory under `/var/lib/containerd/tmpmounts/`, computes the diffID from the decompressed stream, and -- with a patched containerd (see next section) -- deletes the temporary directory when done.  The compressed blob stays in the content store; the FUSE mount serves all subsequent reads from it.
-
-Practical impact:
-
-- **At rest:** only compressed blobs on disk, no extracted copies -- the disk-space goal is met
-- **During pull:** the full uncompressed layer is temporarily written to and immediately deleted from disk; for a golang-sized image (~300 MiB compressed, ~800 MiB uncompressed) this means pull I/O is roughly 2.7x a bare download
-- **Container start:** reads come from the FUSE mount backed by the compressed blob, as intended
-
-The real fix requires decoupling fetch from extraction inside containerd.  A custom differ plugin registered within the containerd process could fetch without extracting, but proxy snapshotters can't reach the containerd plugin registry.  No upstream API for "fetch-only" applies exists today.  Until one does, every image pull discards roughly 2-3x the image's compressed size in temporary disk I/O.
-
-## Caveat: the temp dir cleanup requires a patched containerd
-
-This doesn't fix the fundamental problem -- extraction still happens in full; it just ensures the extracted content is actually deleted afterward rather than accumulating on disk forever.
-
-Stock containerd's [`WithTempMount`](https://github.com/containerd/containerd/blob/v2.3.2/core/mount/temp.go#L42-L53) cleans up the temp directory with `os.Remove`, which returns `ENOTEMPTY` on a non-empty directory and does nothing further -- the error is logged and swallowed.  Since the extraction callback wrote the full uncompressed layer into the directory before cleanup ran, `os.Remove` always fails, and the extracted content accumulates indefinitely under `/var/lib/containerd/tmpmounts/`.  Without the patch, every `docker pull` permanently leaves the full uncompressed layer on disk rather than just transiently.
-
-The fix:
-
-```diff
---- a/core/mount/temp.go
-+++ b/core/mount/temp.go
-@@ -45,9 +45,18 @@ func WithTempMount(ctx context.Context, mounts []Mount, f func(root string) erro
- 	// the mounted dir. However, if we use Remove, even though we won't
- 	// successfully delete the temp dir and it may leak, we won't loss data
- 	// from the mounted dir.
- 	// For details, please refer to #1868 #1785.
-+	//
-+	// When no mounts were attempted, nothing is mounted under root, so
-+	// RemoveAll is safe as a fallback if Remove fails (e.g. when the callback
-+	// wrote files directly into root with no prior mount syscall).
- 	defer func() {
- 		if uerr = os.Remove(root); uerr != nil {
--			log.G(ctx).WithError(uerr).WithField("dir", root).Error("failed to remove mount temp dir")
-+			if len(mounts) == 0 {
-+				uerr = os.RemoveAll(root)
-+			}
-+			if uerr != nil {
-+				log.G(ctx).WithError(uerr).WithField("dir", root).Error("failed to remove mount temp dir")
-+			}
- 		}
- 	}()
-```
-
-When `len(mounts) == 0`, no mount syscall was made, so nothing is live in the directory and `os.RemoveAll` is safe.  This should be submitted upstream; until it lands in a released containerd, you'll need to build from source.
+A FUSE-based containerd proxy snapshotter that mounts OCI image layers directly from the content store -- no extraction step, no duplicate disk usage.
 
 ## Why?
 
@@ -81,27 +30,44 @@ Add the following to your `config.toml` (typically `/etc/containerd/config.toml`
 
 ```toml
 [proxy_plugins.tarfs]
-  type = "snapshot"
+  type    = "snapshot"
   address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+[proxy_plugins.tardiffs]
+  type    = "diff"
+  address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["tardiffs", "walking"]
 
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   snapshotter = "tarfs"
-  platform = "linux"
+  differ      = "tardiffs"
+  platform    = "linux"
 ```
 
-The `unpack_config` entry is required so that the transfer service sets `containerd.io/snapshot/diff-id` labels during image pulls -- without it, layer blobs can't be resolved back to their content store entries.  The `platform` field cannot be omitted (an empty string fails to parse), but `"linux"` matches all Linux architectures since `check_platform_supported` defaults to `false`, which means only the OS is checked -- cross-architecture pulls (`--platform linux/arm64` on an amd64 host, etc.) work correctly.
+Three entries are needed because `docker pull` and `ctr images pull` route through entirely separate subsystems despite sharing the same containerd daemon.
 
-containerd v2.0.x predates `check_platform_supported`, so `platform = "linux"` only matches the host architecture there and cross-architecture pulls fail.  The workaround is to replace the single entry with one per architecture, using `differ = "walking"` on any entry whose platform does not match the host (since v2.0.x selects the differ by matching the configured platform against the host's registered differs, and specifying the differ by name bypasses that check):
+**`docker pull`** (with `containerd-snapshotter: true`) calls `client.Pull()` → `unpack.Unpacker` → `io.containerd.service.v1.diff-service`.  It never consults `unpack_config`.  The `[plugins."io.containerd.service.v1.diff-service"]` stanza puts `tardiffs` first in the differ list so Docker's layer extraction calls land on our proxy differ.  Because the diff-service list is global (no per-snapshotter routing), `tardiffs` returns `codes.Unimplemented` for any Apply with non-empty mounts -- that signals the diff service to fall through to the walking differ, leaving overlayfs, CRI, and any other non-tarfs snapshotter unaffected.  The tarfs snapshotter always returns nil mounts for extraction-keyed snapshots, so zero-mount calls are always tarfs extractions.
+
+**`ctr images pull`** (without `--local`) calls `client.Transfer()` instead, which goes through the transfer service and reads `unpack_config`.  The `[[plugins."io.containerd.transfer.v1.local".unpack_config]]` entry covers this path.  It also sets `containerd.io/snapshot/diff-id` labels on each snapshot so that layer blobs can be resolved back to their content store entries.
+
+If `docker pull` used the transfer service (or if the diff service had per-snapshotter routing), only one of these entries would be needed.  It does not, and it does not.
+
+The `platform` field in `unpack_config` cannot be omitted -- `platforms.Parse("")` hard-errors at containerd startup, and `"*"` is explicitly rejected.  `"linux"` without an explicit architecture fills in `runtime.GOARCH` when parsed, but `check_platform_supported` defaults to `false`, which switches snapshot-selection from `platforms.Only` (exact OS and architecture) to `platforms.OnlyOS` (OS only) -- so `"linux"` covers `linux/amd64`, `linux/arm64`, and all other Linux architectures without listing each.  Note: `differ = "tardiffs"` bypasses a separate platform scan (differ-selection at plugin init time, not snapshot-selection); `platform` still governs which `unpack_config` entry handles each pull.
+
+containerd v2.0.x predates `check_platform_supported` and always uses `platforms.Only` (exact OS and architecture match) -- `"linux"` resolves as `linux/<host-arch>` and cross-architecture pulls fail because no entry matches.  The workaround is per-architecture entries, each with `differ = "tardiffs"`:
 
 ```toml
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   snapshotter = "tarfs"
-  platform = "linux/amd64"
+  differ      = "tardiffs"
+  platform    = "linux/amd64"
 
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   snapshotter = "tarfs"
-  platform = "linux/arm64"
-  differ = "walking"
+  differ      = "tardiffs"
+  platform    = "linux/arm64"
 ```
 
 After updating the config, start `containerd-snapshotter-tarfs` before (or alongside) `containerd`, then pull and run images using `--snapshotter tarfs`:
@@ -147,3 +113,56 @@ $ unshare --user --map-root-user --mount -- bash
 ```
 
 All processes that need to share FUSE mounts (`containerd`, `containerd-snapshotter-tarfs`, `ctr`) must run inside the _same_ namespace -- each separate `unshare` call creates a distinct mount namespace.
+
+## Future improvements
+
+### Skip decompression entirely at pull time
+
+The tardiffs proxy differ currently decompresses each layer blob in full (streaming, no disk writes) to compute the diffID.  This is necessary because containerd's unpack pipeline knows the expected diffID -- it's in the image config, already verified through the manifest chain -- but never passes it to the differ's `Apply` call.  If it did, tardiffs could return it directly and skip decompression entirely.
+
+The change is small: add an `ExpectedLayerDiffID digest.Digest` field to `diff.ApplyConfig` in `core/diff/diff.go`, thread `diffIDs[i]` from the unpacker (which has it in scope at the `a.Apply()` call site in `core/unpack/unpacker.go`) into the `ApplyOpts`, and encode it in `diff.v1.ApplyRequest` (via the existing `payloads` map or a new first-class field).  With that in place, tardiffs can short-circuit to verifying the blob exists and returning the provided diffID -- zero decompression on any pull.
+
+### Use a single name for both proxy plugins
+
+The plugin registry uses `(type, id)` pairs as the uniqueness key, so `SnapshotPlugin/"tarfs"` and `DiffPlugin/"tardiffs"` coexist without conflict -- native plugins do exactly this (the `erofs` snapshotter and differ share `id = "erofs"`, registered in separate `init()` calls).  For proxy plugins the config struct only supports one `type` per `[proxy_plugins.<name>]` stanza, and TOML forbids duplicate keys, forcing the separate `tarfs` and `tardiffs` entries.
+
+Changing `ProxyPlugin.Type string` to `Types []string` in `cmd/containerd/server/config/config.go` and iterating in `LoadPlugins()` would collapse this to a single stanza:
+
+```toml
+[proxy_plugins.tarfs]
+  types   = ["snapshot", "diff"]
+  address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  snapshotter = "tarfs"
+  differ      = "tarfs"
+```
+
+### Fix `WithTempMount` cleanup in upstream containerd
+
+`core/mount/temp.go`'s `WithTempMount` uses `os.Remove` to clean up the temp directory after the callback returns.  `os.Remove` fails silently with `ENOTEMPTY` on a non-empty directory, so any caller that invokes `WithTempMount` with zero mounts and a callback that writes files permanently leaks the extracted content under `/var/lib/containerd/tmpmounts/`.  The tarfs snapshotter returns empty mounts for extraction-keyed snapshots; with tardiffs configured containerd never reaches `WithTempMount` for those snapshots, but the underlying bug affects other callers and should be fixed upstream:
+
+```diff
+--- a/core/mount/temp.go
++++ b/core/mount/temp.go
+@@ -45,9 +45,18 @@ func WithTempMount(ctx context.Context, mounts []Mount, f func(root string) erro
+ 	// the mounted dir. However, if we use Remove, even though we won't
+ 	// successfully delete the temp dir and it may leak, we won't loss data
+ 	// from the mounted dir.
+ 	// For details, please refer to #1868 #1785.
++	//
++	// When no mounts were attempted, nothing is mounted under root, so
++	// RemoveAll is safe as a fallback if Remove fails (e.g. when the callback
++	// wrote files directly into root with no prior mount syscall).
+ 	defer func() {
+ 		if uerr = os.Remove(root); uerr != nil {
+-			log.G(ctx).WithError(uerr).WithField("dir", root).Error("failed to remove mount temp dir")
++			if len(mounts) == 0 {
++				uerr = os.RemoveAll(root)
++			}
++			if uerr != nil {
++				log.G(ctx).WithError(uerr).WithField("dir", root).Error("failed to remove mount temp dir")
++			}
+ 		}
+ 	}()
+```

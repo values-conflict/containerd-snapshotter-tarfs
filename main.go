@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/v2/contrib/snapshotservice"
 	"github.com/containerd/containerd/v2/core/content/proxy"
@@ -56,6 +57,7 @@ func run() error {
 
 	rpc := grpc.NewServer()
 	snapshotsapi.RegisterSnapshotsServer(rpc, snapshotservice.FromSnapshotter(sn))
+	diffapi.RegisterDiffServer(rpc, NewTarfsDiffer(cs))
 
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o700); err != nil {
 		return fmt.Errorf("creating socket directory: %w", err)

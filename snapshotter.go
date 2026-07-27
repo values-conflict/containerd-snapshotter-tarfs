@@ -527,7 +527,7 @@ func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 // mountsFor returns the []mount.Mount instructions for the given snapshot.
 func (s *Snapshotter) mountsFor(key string, kind snapshots.Kind, am *activeMount) []mount.Mount {
-	// extraction snapshot: return empty mounts so containerd can extract into a throwaway temp dir without any bind mount syscall
+	// extraction snapshot: return empty (nil) mounts -- this is the signal tardiffs uses to identify tarfs extractions; tardiffs returns codes.Unimplemented for non-empty mounts so the diff service falls through to walking for other snapshotters; without tardiffs in [plugins."io.containerd.service.v1.diff-service"] default, the walking differ runs and extracts into a temporary directory under /var/lib/containerd/tmpmounts/ which it then fails to clean up (see core/mount/temp.go WithTempMount, os.Remove vs os.RemoveAll bug)
 	if kind == snapshots.KindActive && am.upperDir == "" && am.mountpoint == "" {
 		return nil
 	}

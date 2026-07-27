@@ -134,12 +134,20 @@ jobs:
         run: |
           sudo tee /etc/containerd/conf.d/tarfs.toml << 'EOF'
           [proxy_plugins.tarfs]
-            type = "snapshot"
+            type    = "snapshot"
             address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+          [proxy_plugins.tardiffs]
+            type    = "diff"
+            address = "/run/containerd-snapshotter-tarfs/snapshotter.sock"
+
+          [plugins."io.containerd.service.v1.diff-service"]
+            default = ["tardiffs", "walking"]
 
           [[plugins."io.containerd.transfer.v1.local".unpack_config]]
             snapshotter = "tarfs"
-            platform = "linux"
+            differ      = "tardiffs"
+            platform    = "linux"
           EOF
 
           jq --tab '."storage-driver" = "tarfs"' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new

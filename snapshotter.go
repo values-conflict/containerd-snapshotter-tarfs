@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -13,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,8 +36,11 @@ import (
 )
 
 const (
-	labelNS          = "tianon.xyz/values-conflict/tarfs"
-	labelBlobChainID = labelNS + "/chain-id" // label on content-store blobs: chainID of the snapshot that uses this blob
+	labelNS               = "tianon.xyz/values-conflict/tarfs"
+	labelBlobChainID      = labelNS + "/chain-id"                      // label on content-store blobs: chainID of the snapshot that uses this blob
+	labelGsipIndex        = "containerd.io/gc.ref.content.gsip-index"  // label on compressed blobs: digest of the pre-built gsip checkpoint index blob; the gc.ref.content prefix anchors the index blob under GC
+	labelTarfsIndex       = "containerd.io/gc.ref.content.tarfs-index" // label on layer blobs: digest of the pre-built tarfs entry index blob; with both gsip and tarfs indices present, openBlobAsFS needs zero decompression
+	labelUncompressedSize = labelNS + "/uncompressed-size"             // label on compressed blobs: uncompressed byte count, enabling Apply short-circuit on re-pulls without a cached uncompressed blob
 )
 
 // Snapshotter implements snapshots.Snapshotter by serving OCI image layers directly from the containerd content store via FUSE, without extraction.
@@ -591,10 +592,11 @@ func (s *Snapshotter) readContentBlob(ctx context.Context, d digest.Digest) ([]b
 	return io.ReadAll(io.NewSectionReader(ra, 0, ra.Size()))
 }
 
-// openBlobAsFS opens the blob at blobDigest from the content store and returns it as an fs.FS backed by tarfs.  Gzip-compressed blobs are handled transparently.
+// openBlobAsFS opens the blob at blobDigest from the content store and returns it as an fs.FS backed by tarfs.  When both a gsip checkpoint index (labelGsipIndex) and a tarfs entry index (labelTarfsIndex) are present, the function returns without any decompression; FUSE reads then decompress on demand from the nearest checkpoint.
 func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest) (fs.FS, error) {
 	// blob data is immutable (content-addressed); detach from the snapshot RPC context so the ReaderAt outlives it, while preserving gRPC metadata (namespace etc.)
-	ra, size, err := s.openBlob(context.WithoutCancel(ctx), ocispec.Descriptor{Digest: blobDigest})
+	pctx := propagateNamespace(context.WithoutCancel(ctx))
+	ra, size, err := s.openBlob(pctx, ocispec.Descriptor{Digest: blobDigest})
 	if err != nil {
 		return nil, fmt.Errorf("opening blob %s: %w", blobDigest, err)
 	}
@@ -611,41 +613,64 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 	}
 	tarSize := size
 
+	// gsipReader is set during a fresh gzip scan; drained and encoded after tarfs.New
+	var gsipReader *gsip.Reader
+	// saveTarfsIndex is true when tarfs.New ran against a content-store-backed reader; false for the in-memory bytes.Buffer zstd fallback (offsets are not meaningful outside that buffer)
+	saveTarfsIndex := true
+
 	switch {
 	case header[0] == 0x1f && header[1] == 0x8b:
 		// gzip-compressed blob (application/vnd.oci.image.layer.v1.tar+gzip)
-		// gsip builds deflate checkpoints for seek-ahead but only at block
-		// boundaries (~32 KB each).  Tiny layers have zero or one block, giving
-		// zero checkpoints, so gsip.ReadAt fails for any non-zero offset.
-		// Decompress the whole blob into a bytes.Buffer for reliable random
-		// access; for large layers (>=4 MiB compressed) use gsip instead.
-		const gsipThreshold = 4 << 20 // 4 MiB compressed
-		if size < gsipThreshold {
-			r, gzErr := gzip.NewReader(io.NewSectionReader(ra, 0, size))
-			if gzErr != nil {
-				ra.Close()
-				return nil, fmt.Errorf("creating gzip reader for %s: %w", blobDigest, gzErr)
+		blobInfo, _ := s.cs.Info(pctx, blobDigest)
+		gsipStr := blobInfo.Labels[labelGsipIndex]
+		tarfsStr := blobInfo.Labels[labelTarfsIndex]
+
+		if gsipStr != "" && tarfsStr != "" {
+			// full fast path: both indices present -- reconstruct fs.FS with zero decompression
+			if gsipRA := s.loadContentBlob(pctx, gsipStr); gsipRA != nil {
+				if tarfsRA := s.loadContentBlob(pctx, tarfsStr); tarfsRA != nil {
+					zr, decErr := gsip.Decode(ra, size, io.NewSectionReader(gsipRA, 0, gsipRA.Size()))
+					gsipRA.Close()
+					if decErr == nil {
+						fsys, tDecErr := tarfs.Decode(zr, io.NewSectionReader(tarfsRA, 0, tarfsRA.Size()))
+						tarfsRA.Close()
+						if tDecErr == nil {
+							return fsys, nil
+						}
+						log.Printf("tarfs: tarfs decode for %s failed, rebuilding: %v", blobDigest, tDecErr)
+					} else {
+						tarfsRA.Close()
+						log.Printf("tarfs: gsip decode for %s failed, rebuilding: %v", blobDigest, decErr)
+					}
+				} else {
+					gsipRA.Close()
+				}
 			}
-			var buf bytes.Buffer
-			if _, gzErr = io.Copy(&buf, r); gzErr != nil {
-				ra.Close()
-				return nil, fmt.Errorf("decompressing blob for %s: %w", blobDigest, gzErr)
+		} else if gsipStr != "" {
+			// partial fast path: gsip index present, tarfs index absent -- skip gsip scan, save tarfs index after tarfs.New
+			if gsipRA := s.loadContentBlob(pctx, gsipStr); gsipRA != nil {
+				zr, decErr := gsip.Decode(ra, size, io.NewSectionReader(gsipRA, 0, gsipRA.Size()))
+				gsipRA.Close()
+				if decErr == nil {
+					tarRA = zr
+					tarSize = 1<<63 - 1 // uncompressed size unknown
+					break
+				}
+				log.Printf("tarfs: gsip decode for %s failed, rebuilding: %v", blobDigest, decErr)
 			}
-			r.Close()
-			data := buf.Bytes()
-			tarRA = bytes.NewReader(data)
-			tarSize = int64(len(data))
-		} else {
-			zr, gsipErr := gsip.NewReader(ra, size)
-			if gsipErr != nil {
-				ra.Close()
-				return nil, fmt.Errorf("creating gsip reader for %s: %w", blobDigest, gsipErr)
-			}
-			tarRA = zr
-			tarSize = 1<<63 - 1 // uncompressed size unknown
 		}
+		// fresh scan: build gsip checkpoints and tarfs index in one pass
+		zr, gsipErr := gsip.NewReader(ra, size)
+		if gsipErr != nil {
+			ra.Close()
+			return nil, fmt.Errorf("creating gsip reader for %s: %w", blobDigest, gsipErr)
+		}
+		gsipReader = zr
+		tarRA = zr
+		tarSize = 1<<63 - 1 // uncompressed size unknown
+
 	case header[0] == 0x28 && header[1] == 0xB5 && header[2] == 0x2F && header[3] == 0xFD:
-		// zstd-compressed blob (application/vnd.oci.image.layer.v1.tar+zstd, produced by BuildKit); stream directly into the content store so the result is file-backed, falling back to bytes.Buffer only if the content store path fails
+		// zstd-compressed blob (application/vnd.oci.image.layer.v1.tar+zstd, produced by BuildKit); cache the full uncompressed content in the content store so the result is file-backed, falling back to bytes.Buffer only if the content store path fails
 		zr, zstdErr := zstd.NewReader(io.NewSectionReader(ra, 0, size))
 		if zstdErr != nil {
 			ra.Close()
@@ -655,6 +680,20 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 		zr.Close()
 		if cacheErr == nil {
 			ra.Close()
+			// tarfs fast path: skip tarfs.New if entry index is already saved
+			if tarfsStr := func() string {
+				info, _ := s.cs.Info(pctx, blobDigest)
+				return info.Labels[labelTarfsIndex]
+			}(); tarfsStr != "" {
+				if tarfsRA := s.loadContentBlob(pctx, tarfsStr); tarfsRA != nil {
+					fsys, decErr := tarfs.Decode(ucRA, io.NewSectionReader(tarfsRA, 0, tarfsRA.Size()))
+					tarfsRA.Close()
+					if decErr == nil {
+						return fsys, nil
+					}
+					log.Printf("tarfs: tarfs decode for %s failed, rebuilding: %v", blobDigest, decErr)
+				}
+			}
 			tarRA = ucRA
 			tarSize = ucSize
 		} else {
@@ -673,19 +712,55 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 			data := buf.Bytes()
 			tarRA = bytes.NewReader(data)
 			tarSize = int64(len(data))
+			saveTarfsIndex = false // in-memory buffer; entry offsets are not meaningful outside this call
 		}
+
 	default:
+		// uncompressed tar: check for tarfs fast path
+		if tarfsStr := func() string {
+			info, _ := s.cs.Info(pctx, blobDigest)
+			return info.Labels[labelTarfsIndex]
+		}(); tarfsStr != "" {
+			if tarfsRA := s.loadContentBlob(pctx, tarfsStr); tarfsRA != nil {
+				fsys, decErr := tarfs.Decode(ra, io.NewSectionReader(tarfsRA, 0, tarfsRA.Size()))
+				tarfsRA.Close()
+				if decErr == nil {
+					return fsys, nil
+				}
+				log.Printf("tarfs: tarfs decode for %s failed, rebuilding: %v", blobDigest, decErr)
+			}
+		}
 		tarRA = ra
 	}
 
 	fsys, err := tarfs.New(tarRA, tarSize)
+
+	// always drain the gsip goroutine before returning, regardless of tarfs.New success, to avoid a goroutine leak
+	if gsipReader != nil {
+		gsipReader.Wait()
+		if err == nil {
+			var indexBuf bytes.Buffer
+			if encErr := gsipReader.Encode(&indexBuf); encErr == nil {
+				ingestGsipIndex(pctx, s.cs, blobDigest, &indexBuf)
+			} else {
+				log.Printf("tarfs: gsip encode for %s: %v (skipping index save)", blobDigest, encErr)
+			}
+		}
+	}
+
+	// save tarfs entry index so future openBlobAsFS calls can skip tarfs.New entirely
+	if saveTarfsIndex && err == nil {
+		var tarfsBuf bytes.Buffer
+		if encErr := fsys.Encode(&tarfsBuf); encErr == nil {
+			ingestTarfsIndex(pctx, s.cs, blobDigest, &tarfsBuf)
+		} else {
+			log.Printf("tarfs: tarfs encode for %s: %v (skipping index save)", blobDigest, encErr)
+		}
+	}
+
 	if err != nil {
 		ra.Close()
 		return nil, fmt.Errorf("building tarfs for %s: %w", blobDigest, err)
-	}
-	// tarfs.New just completed the sequential scan, sending all checkpoint updates into the gsip drain goroutine's channel; yield so it can flush them into r.checkpoints before any FUSE read calls gsip.ReadAt
-	if _, ok := tarRA.(*gsip.Reader); ok {
-		runtime.Gosched()
 	}
 	return fsys, nil
 }
@@ -763,6 +838,104 @@ func (s *Snapshotter) ingestDecompressedBlob(ctx context.Context, compressedDige
 		return nil, 0, fmt.Errorf("opening freshly ingested decompressed blob %s: %w", cachedDgst, err)
 	}
 	return ra, n, nil
+}
+
+// ingestGsipIndex saves the pre-built gsip checkpoint index for compressedDigest into the content store and labels the source blob with labelGsipIndex for fast lookup on future openBlobAsFS calls.  The index blob is anchored under GC via the gc.ref.content prefix on the label key.  Errors are logged and do not fail the caller -- a missing index is always correctable by a fresh scan.
+func ingestGsipIndex(ctx context.Context, cs content.Store, compressedDigest digest.Digest, indexData *bytes.Buffer) {
+	// fast-exit if the label is already set (e.g. index built by a concurrent Apply or a previous process)
+	if info, infoErr := cs.Info(ctx, compressedDigest); infoErr == nil && info.Labels[labelGsipIndex] != "" {
+		return
+	}
+
+	cw, err := cs.Writer(ctx, content.WithRef("gsip-index-"+compressedDigest.String()))
+	if err != nil {
+		log.Printf("tarfs: gsip index for %s: open writer: %v (skipping)", compressedDigest, err)
+		return
+	}
+	defer cw.Close()
+
+	if status, statusErr := cw.Status(); statusErr == nil && status.Offset > 0 {
+		if truncErr := cw.Truncate(0); truncErr != nil {
+			log.Printf("tarfs: gsip index for %s: truncate: %v (skipping)", compressedDigest, truncErr)
+			return
+		}
+	}
+
+	n, copyErr := io.Copy(cw, indexData)
+	if copyErr != nil {
+		log.Printf("tarfs: gsip index for %s: write: %v (skipping)", compressedDigest, copyErr)
+		return
+	}
+
+	indexDigest := cw.Digest()
+	if commitErr := cw.Commit(ctx, n, indexDigest); commitErr != nil && !errdefs.IsAlreadyExists(commitErr) {
+		log.Printf("tarfs: gsip index for %s: commit: %v (skipping)", compressedDigest, commitErr)
+		return
+	}
+
+	if _, updateErr := cs.Update(ctx, content.Info{
+		Digest: compressedDigest,
+		Labels: map[string]string{labelGsipIndex: indexDigest.String()},
+	}, "labels."+labelGsipIndex); updateErr != nil {
+		log.Printf("tarfs: gsip index for %s: label: %v (continuing)", compressedDigest, updateErr)
+	}
+}
+
+// ingestTarfsIndex saves the pre-built tarfs entry index for blobDigest into the content store and labels the source blob with labelTarfsIndex.  Combined with a pre-built gsip index, this allows openBlobAsFS to reconstruct the fs.FS without any decompression.  Errors are logged and do not fail the caller.
+func ingestTarfsIndex(ctx context.Context, cs content.Store, blobDigest digest.Digest, indexData *bytes.Buffer) {
+	if info, infoErr := cs.Info(ctx, blobDigest); infoErr == nil && info.Labels[labelTarfsIndex] != "" {
+		return
+	}
+
+	cw, err := cs.Writer(ctx, content.WithRef("tarfs-index-"+blobDigest.String()))
+	if err != nil {
+		log.Printf("tarfs: tarfs index for %s: open writer: %v (skipping)", blobDigest, err)
+		return
+	}
+	defer cw.Close()
+
+	if status, statusErr := cw.Status(); statusErr == nil && status.Offset > 0 {
+		if truncErr := cw.Truncate(0); truncErr != nil {
+			log.Printf("tarfs: tarfs index for %s: truncate: %v (skipping)", blobDigest, truncErr)
+			return
+		}
+	}
+
+	n, copyErr := io.Copy(cw, indexData)
+	if copyErr != nil {
+		log.Printf("tarfs: tarfs index for %s: write: %v (skipping)", blobDigest, copyErr)
+		return
+	}
+
+	indexDigest := cw.Digest()
+	if commitErr := cw.Commit(ctx, n, indexDigest); commitErr != nil && !errdefs.IsAlreadyExists(commitErr) {
+		log.Printf("tarfs: tarfs index for %s: commit: %v (skipping)", blobDigest, commitErr)
+		return
+	}
+
+	if _, updateErr := cs.Update(ctx, content.Info{
+		Digest: blobDigest,
+		Labels: map[string]string{labelTarfsIndex: indexDigest.String()},
+	}, "labels."+labelTarfsIndex); updateErr != nil {
+		log.Printf("tarfs: tarfs index for %s: label: %v (continuing)", blobDigest, updateErr)
+	}
+}
+
+// loadContentBlob resolves dgstStr as a content-store digest, opens the blob, and returns its ReaderAt.  Returns nil on any error; callers check for nil and fall back gracefully.
+func (s *Snapshotter) loadContentBlob(ctx context.Context, dgstStr string) content.ReaderAt {
+	dgst, err := digest.Parse(dgstStr)
+	if err != nil {
+		return nil
+	}
+	info, err := s.cs.Info(ctx, dgst)
+	if err != nil {
+		return nil
+	}
+	ra, err := s.cs.ReaderAt(ctx, ocispec.Descriptor{Digest: dgst, Size: info.Size})
+	if err != nil {
+		return nil
+	}
+	return ra
 }
 
 // openBlob returns a ReaderAt and size for the blob described by desc.

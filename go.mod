@@ -41,3 +41,8 @@ require (
 // https://github.com/cpuguy83/go2fuse/pull/2: "Set `Nlink` in `fillAttrFromFileInfo`"
 // https://github.com/cpuguy83/go2fuse/pull/3: "Implement `NodeReader` on `fileNode`"
 replace github.com/cpuguy83/go2fuse => github.com/tianon-sso/go2fuse v0.0.0-20260614052731-6a3eb2784728
+
+// https://github.com/jonjohnsonjr/targz/pull/5: "Fix data race and goroutine leak in `gsip.Reader`; add `Wait`"
+// https://github.com/jonjohnsonjr/targz/pull/6: "Use 1 MiB buffered reader in checkpoint-derived readers, matching the frontier"
+// https://github.com/jonjohnsonjr/targz/pull/7: "Fix `Decode` to rebuild `dir`, `dirs`, and `root` after loading TOC"
+replace github.com/jonjohnsonjr/targz => github.com/tianon-sso/jon-go-targz v0.0.0-20260728221825-f2af95f0bab0

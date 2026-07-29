@@ -21,7 +21,7 @@ $ containerd-snapshotter-tarfs [flags]
 Flags:
 
 - `--socket` -- unix socket path for the snapshotter gRPC server (default: `/run/containerd-snapshotter-tarfs/snapshotter.sock`)
-- `--state-dir` -- directory for snapshotter metadata and FUSE mount points (default: `/var/lib/containerd-snapshotter-tarfs`)
+- `--state-dir` -- runtime-only state directory for FUSE mount points and overlay upper/work dirs; not preserved across restarts (default: `/run/containerd-snapshotter-tarfs`)
 - `--containerd-socket` -- containerd gRPC socket, for content store access (default: `/run/containerd/containerd.sock`)
 
 ## Configuring containerd
@@ -46,13 +46,13 @@ Add the following to your `config.toml` (typically `/etc/containerd/config.toml`
   platform    = "linux"
 ```
 
-Three entries are needed because `docker pull` and `ctr images pull` route through entirely separate subsystems despite sharing the same containerd daemon.
+Four entries are needed: two register the proxy plugins themselves (`[proxy_plugins.tarfs]` as a snapshot plugin, `[proxy_plugins.tardiffs]` as a differ), and two configure the per-pull-path routing.
 
 **`docker pull`** (with `containerd-snapshotter: true`) calls `client.Pull()` → `unpack.Unpacker` → `io.containerd.service.v1.diff-service`.  It never consults `unpack_config`.  The `[plugins."io.containerd.service.v1.diff-service"]` stanza puts `tardiffs` first in the differ list so Docker's layer extraction calls land on our proxy differ.  Because the diff-service list is global (no per-snapshotter routing), `tardiffs` returns `codes.Unimplemented` for any Apply with non-empty mounts -- that signals the diff service to fall through to the walking differ, leaving overlayfs, CRI, and any other non-tarfs snapshotter unaffected.  The tarfs snapshotter always returns nil mounts for extraction-keyed snapshots, so zero-mount calls are always tarfs extractions.
 
 **`ctr images pull`** (without `--local`) calls `client.Transfer()` instead, which goes through the transfer service and reads `unpack_config`.  The `[[plugins."io.containerd.transfer.v1.local".unpack_config]]` entry covers this path.  It also sets `containerd.io/snapshot/diff-id` labels on each snapshot so that layer blobs can be resolved back to their content store entries.
 
-If `docker pull` used the transfer service (or if the diff service had per-snapshotter routing), only one of these entries would be needed.  It does not, and it does not.
+If `docker pull` used the transfer service (or if the diff service had per-snapshotter routing), only one routing entry would be needed.  It does not, and it does not.
 
 The `platform` field in `unpack_config` cannot be omitted -- `platforms.Parse("")` hard-errors at containerd startup, and `"*"` is explicitly rejected.  `"linux"` without an explicit architecture fills in `runtime.GOARCH` when parsed, but `check_platform_supported` defaults to `false`, which switches snapshot-selection from `platforms.Only` (exact OS and architecture) to `platforms.OnlyOS` (OS only) -- so `"linux"` covers `linux/amd64`, `linux/arm64`, and all other Linux architectures without listing each.  Note: `differ = "tardiffs"` bypasses a separate platform scan (differ-selection at plugin init time, not snapshot-selection); `platform` still governs which `unpack_config` entry handles each pull.
 

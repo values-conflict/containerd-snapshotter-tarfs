@@ -26,7 +26,7 @@ The standard containerd snapshotters (overlay, native) extract each layer's tar 
 **Core pipeline:** for each snapshot view/mount request, we:
 1. Extract the topChainID from the parent snapshot's backend key (last `"/"` component)
 2. Call `buildLayerStack(topChainID)` to find all layer blobs from base to topChainID
-3. Open each blob: gzip layers via `gsip.NewReader` or `bytes.Buffer`; plain tarballs directly
+3. Open each blob: gzip via `gsip.NewReader` (or zero-decompression `gsip.Decode` from a persisted checkpoint index), zstd via `klauspost/compress/zstd`, uncompressed tarballs directly
 4. Feed each `io.ReaderAt` into `tarfs.New` to get a seek-capable `fs.FS` over the tar entries
 5. Stack the per-layer `fs.FS` instances into a `LayeredFS` that implements whiteout semantics
 6. Mount the `LayeredFS` as a FUSE filesystem via `cpuguy83/go2fuse` (which adapts `io/fs.FS` to hanwen/go-fuse)
@@ -36,6 +36,8 @@ The standard containerd snapshotters (overlay, native) extract each layer's tar 
 - `Prepare` (writable active) -- calls `buildLayerStack`, mounts FUSE, creates `upper/` and `work/` dirs, returns `type: overlay` with FUSE as lowerdir.  Extraction snapshots return empty mounts so containerd can extract into a throwaway temp dir.
 - `View` (read-only active) -- calls `buildLayerStack`, mounts FUSE, returns a `ro` bind mount.
 - `Commit` -- records kind and parent chain in memory; propagates chain info for Docker init-layer continuity.
+
+**`tardiffs` proxy differ:** handles `Apply` calls from containerd's `diff-service` (the `docker pull` path).  Zero-mount calls are tarfs extractions -- `tardiffs` decompresses the layer blob in memory (gzip: streaming hash via `gsip.NewReader`; zstd: via `klauspost/compress/zstd`; uncompressed: direct hash) to compute the diffID, saves `containerd.io/uncompressed` and `tianon.xyz/values-conflict/tarfs/uncompressed-size` labels, and persists the gsip checkpoint index for gzip blobs.  Re-pulls short-circuit: if both labels are already present, `Apply` returns immediately.  Non-zero-mount calls return `codes.Unimplemented`, signaling the diff service to fall through to the walking differ for non-tarfs snapshotters.
 
 **Layer→blob mapping** (`buildLayerStack`): walks content-store blobs labeled `containerd.io/gc.ref.content.config` (image manifests), parses each manifest's config `rootfs.diff_ids`, recomputes the OCI chain formula (`chainID[i] = sha256(chainID[i-1] + " " + diffID[i])`) to find which layer index matches topChainID, and collects all layer blobs from base up to that index.  Found blobs are labeled `tianon.xyz/values-conflict/tarfs/chain-id = chainID` for fast future lookup.  Three-pass fallback: labeled manifests → all blobs → chainID formula (for docker commit/build layers whose manifests aren't labeled).
 
@@ -103,7 +105,7 @@ The containerd v2 project splits its API (gRPC-generated protobuf stubs) into a 
 
 **BuildKit layer compression:** BuildKit produces zstd-compressed layers (`application/vnd.oci.image.layer.v1.tar+zstd`, magic `0x28 0xB5 0x2F 0xFD`) while the classic builder produces gzip.  Failing to detect zstd causes `tarfs.New` to silently parse the compressed frame as an uncompressed tar, returning an empty FS with no error.
 
-**gsip and random-access reads:** `gsip.NewReader` builds gzip checkpoints asynchronously via a goroutine.  `tarfs.New` triggers the initial sequential scan.  The goroutine may not finish receiving all checkpoints before `ReadAt` is called for random access.  For tests, use uncompressed tar blobs (diffID == blob digest, no gsip needed) to test the fast path.  Real production images (gzip layers) work correctly as long as the sequential scan completes before concurrent reads begin -- which is the normal FUSE mount case.
+**gsip and random-access reads:** `gsip.NewReader` builds gzip checkpoints asynchronously via a goroutine; `zr.Wait()` (called in both `Apply` and `openBlobAsFS` after the initial scan) ensures the goroutine drains before `Encode` is called.  The old `runtime.Gosched()` workaround is gone -- `Wait()` is the correct fix.  For tests, use uncompressed tar blobs (diffID == blob digest, no gsip involved) to test the FS layer without gsip timing concerns.
 
 ## FUSE and namespace setup
 
@@ -123,31 +125,14 @@ $ go test -exec "unshare --user --map-root-user --mount" ./...
 
 ## gsip (gzip random-access) notes
 
-`gsip.NewReader` builds deflate checkpoints asynchronously in a goroutine.  For small gzip blobs (< 4 MiB compressed) there is typically only one deflate block and zero checkpoints, making `ReadAt` fail for any non-zero offset.  `openBlobAsFS` decompresses these blobs entirely into a `bytes.Buffer`.  Blobs ≥ 4 MiB use gsip with a `runtime.Gosched()` call after `tarfs.New` to let the checkpoint goroutine drain.
+`openBlobAsFS` uses a tiered approach for gzip layers.  On first access: `gsip.NewReader` builds deflate checkpoints asynchronously; `tarfs.New` does one uncompressed pass to build the entry index; `zr.Wait()` (not `runtime.Gosched()`) ensures the checkpoint goroutine drains before `Encode` is called.  Both indices are then persisted as content-store blobs: `containerd.io/gc.ref.content.gsip-index` (checkpoint index) and `containerd.io/gc.ref.content.tarfs-index` (tar entry index).  On subsequent accesses, `gsip.Decode` + `tarfs.Decode` reconstruct the `fs.FS` with zero decompression -- FUSE reads decompress on demand from the nearest gsip checkpoint.  Index blobs carry `gc.ref.content` labels and are GC-collected alongside their source blob.
+
+`tardiffs.Apply` also builds and persists the gsip checkpoint index for gzip blobs as a side effect of computing the diffID, so by the time `openBlobAsFS` runs the gsip index is typically already present.
 
 ## Content store access
 
 The proxy snapshotter must connect back to containerd's gRPC socket (not directly open the metadata BoltDB) to read content store labels like `containerd.io/uncompressed`.  Direct BoltDB access would block on containerd's exclusive flock.  The gRPC content proxy requires the containerd namespace in the outgoing gRPC context; `propagateNamespace(ctx)` converts the incoming namespace from the snapshot RPC into an outgoing header for content store calls.
 
-## Current status (2026-06-16)
-
-**Phase:** working end-to-end in CI across all supported containerd versions; `docker run`, `docker build` (classic and BuildKit), and `docker commit` all pass.
-
-**Done:**
-- `LayeredFS` with correct OCI whiteout semantics; unit tests pass
-- `TestFUSEMount_singleLayer` passes under `unshare --user --map-root-user --mount`
-- `openLayerByDiffID` with fast path (uncompressed blob at diffID address) and manifest-walk path; integration tests pass
-- Empty-mount extraction: avoids bind mount EPERM, lets blobs stay in content store
-- gsip small-blob fix: blobs < 4 MiB decompressed to `bytes.Buffer` for reliable random access
-- BoltDB/MetaStore eliminated entirely: no `metadata.db`; snapshot kinds and parent chains are in-memory; layer→blob mapping lives as `tianon.xyz/values-conflict/tarfs/chain-id` labels on content-store blobs
-- `buildLayerStack` derives the full ordered layer stack from content-store manifests; three-pass fallback (labeled manifests → all blobs → chainID formula) covers normal pulls, `docker commit`, and BuildKit builds
-- Docker daemon integration: `docker run`, `docker build` (classic and BuildKit), `docker commit`, cross-arch runs all pass in CI
-- `bash:latest`, cross-arch `bash:latest` (arm64), and various `tianon/test:badtars-*` images all tested
-
-**Known limitations:**
-- Writable containers still use `type: overlay` with the FUSE directory as lowerdir; eliminating this requires a writable FUSE implementation (see `TODO.md`)
-- View/Active snapshot state is in-memory only -- containers and image mounts do not survive snapshotter process restarts
-
 ## Maintaining this file
 
-Update the **Current status** section whenever the shape of the project changes -- when a milestone is reached, when a design decision changes, or when a new blocker appears.  Keep the **Done** / **Next** lists current.  If the architecture section diverges from the implementation, fix the architecture section to match.  This file is the primary handoff document between sessions.
+If the architecture section diverges from the implementation, fix the architecture section to match.  This file is the primary handoff document between sessions.

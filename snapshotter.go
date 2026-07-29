@@ -738,6 +738,7 @@ func (s *Snapshotter) openBlobAsFS(ctx context.Context, blobDigest digest.Digest
 	// always drain the gsip goroutine before returning, regardless of tarfs.New success, to avoid a goroutine leak
 	if gsipReader != nil {
 		gsipReader.Wait()
+		gsipReader.Prune()
 		if err == nil {
 			var indexBuf bytes.Buffer
 			if encErr := gsipReader.Encode(&indexBuf); encErr == nil {

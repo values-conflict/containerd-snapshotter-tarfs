@@ -104,6 +104,7 @@ func (d *TarfsDiffer) Apply(ctx context.Context, req *diffapi.ApplyRequest) (*di
 			}
 		}
 		zr.Wait()
+		zr.Prune()
 		diffID := digester.Digest()
 		uncompressedSize := offset
 

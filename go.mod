@@ -37,3 +37,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260610212136-7ab31c22f7ad // indirect
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 )
+
+// https://github.com/jonjohnsonjr/targz/pull/8: "Add `Prune` to trim checkpoint history windows"
+replace github.com/jonjohnsonjr/targz => github.com/tianon-sso/jon-go-targz v0.0.0-20260729235022-685719a56d53

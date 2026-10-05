@@ -1,10 +1,10 @@
 module github.com/values-conflict/containerd-snapshotter-tarfs
 
-go 1.26.6
+go 1.26.8
 
 require (
 	github.com/containerd/containerd/api v1.11.1
-	github.com/containerd/containerd/v2 v2.3.5
+	github.com/containerd/containerd/v2 v2.3.6
 	github.com/containerd/errdefs v1.0.0
 	github.com/cpuguy83/go2fuse v0.0.0-20260702193639-dd8684cea22d
 	github.com/hanwen/go-fuse/v2 v2.10.1

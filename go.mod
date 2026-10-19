@@ -1,6 +1,6 @@
 module github.com/values-conflict/containerd-snapshotter-tarfs
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/containerd/containerd/api v1.11.1
